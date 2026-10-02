@@ -14,6 +14,7 @@ class RequirementsState(TypedDict, total=False):
 
 
 def build_requirements_graph(model: MockAgentModel, checkpointer=None):
+
     def evaluate_requirements(
         state: RequirementsState,
     ) -> dict[str, dict[str, str | None] | int]:

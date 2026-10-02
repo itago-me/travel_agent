@@ -33,5 +33,6 @@ class Consultation:
     status: str
     messages: list[Message] = field(default_factory=list)
     trip_requirements: dict[str, Any] = field(default_factory=dict)
+    planning_constraints: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)

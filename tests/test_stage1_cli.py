@@ -41,3 +41,17 @@ def test_cli_start_resume_and_status_show_persisted_agent_workflow(
     status = json.loads(capsys.readouterr().out)
     assert status["trip_requirements"]["origin"] == "北京"
     assert status["messages"][-1]["role"] == "assistant"
+
+
+def test_cli_lists_tools(capsys):
+    assert main(["tools"]) == 0
+    tools = json.loads(capsys.readouterr().out)
+
+    assert [tool["name"] for tool in tools] == [
+        "calculate_trip_budget",
+        "detect_itinerary_conflicts",
+        "score_trip_options",
+        "search_attractions",
+        "search_hotel_options",
+        "search_transport_options",
+    ]
