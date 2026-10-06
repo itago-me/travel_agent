@@ -40,6 +40,14 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("consultation_id")
     plan.add_argument("--max-tool-calls", type=int, default=6)
 
+    chat = subparsers.add_parser("chat")
+    chat.add_argument("consultation_id")
+    chat.add_argument("--message", required=True)
+    chat.add_argument("--env-file", default=".env")
+    chat.add_argument("--model-name")
+    chat.add_argument("--api-key")
+    chat.add_argument("--base-url")
+
     revise = subparsers.add_parser("revise")
     revise.add_argument("consultation_id")
     revise.add_argument("--message", required=True)
@@ -106,6 +114,17 @@ def main(argv: list[str] | None = None) -> int:
         result = service.plan_consultation(
             args.consultation_id,
             max_tool_calls=args.max_tool_calls,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.command == "chat":
+        result = service.chat_consultation(
+            args.consultation_id,
+            args.message,
+            model_name=args.model_name,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            env_file=args.env_file,
         )
         print(json.dumps(result, ensure_ascii=False))
         return 0

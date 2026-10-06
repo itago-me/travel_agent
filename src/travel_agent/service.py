@@ -28,6 +28,28 @@ from .providers import (
 )
 from .planning import MockPlanningModel, run_planning_graph
 from .planning_revision import parse_planning_revision
+from .agent import AgentSettings, create_agent_app, load_agent_settings
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+
+def _last_message_content(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        content = getattr(message, "content", None)
+        if content:
+            return str(content)
+        if isinstance(message, dict) and message.get("content"):
+            return str(message["content"])
+    return ""
+
+
+def _message_as_dict(message: Any) -> dict[str, Any]:
+    if isinstance(message, dict):
+        return message
+    return {
+        "type": getattr(message, "type", None),
+        "content": getattr(message, "content", ""),
+        "tool_calls": getattr(message, "tool_calls", []),
+    }
 
 
 class ConsultationService:
@@ -67,6 +89,68 @@ class ConsultationService:
 
     def get_consultation(self, consultation_id: str) -> Consultation:
         return self.repository.get_consultation(consultation_id)
+
+    def chat_consultation(
+        self,
+        consultation_id: str,
+        user_message: str,
+        *,
+        model_name: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        env_file: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Run one real model/tool turn for a consultation."""
+        consultation = self.get_consultation(consultation_id)
+        self.append_message(consultation_id, "user", user_message)
+        loaded = load_agent_settings(env_file)
+        settings = AgentSettings(
+            model_mode=loaded.model_mode,
+            model_name=model_name or loaded.model_name,
+            api_key=api_key or loaded.api_key,
+            base_url=base_url or loaded.base_url,
+        )
+        with SqliteSaver.from_conn_string(str(self.checkpoint_path)) as checkpointer:
+            agent = create_agent_app(
+                self.repository.database_path,
+                settings,
+                checkpointer=checkpointer,
+            )
+            config = {"configurable": {"thread_id": consultation.thread_id}}
+            if checkpointer.get_tuple(config) is None:
+                input_messages = [
+                    {"role": message.role, "content": message.content}
+                    for message in self.get_consultation(consultation_id).messages
+                ]
+            else:
+                input_messages = [{"role": "user", "content": user_message}]
+            result = agent.invoke({"messages": input_messages}, config=config)
+        messages = result.get("messages", [])
+        answer = _last_message_content(messages)
+        tool_calls = [
+            call["name"]
+            for message in messages
+            for call in getattr(message, "tool_calls", [])
+            if call.get("name")
+        ]
+        self.append_message(consultation_id, "assistant", answer)
+        self.repository.add_audit_event(
+            AuditEvent(
+                consultation_id=consultation.id,
+                event_type="AGENT_CHAT_COMPLETED",
+                details={
+                    "thread_id": consultation.thread_id,
+                    "tool_calls": tool_calls,
+                },
+            )
+        )
+        return {
+            "consultation_id": consultation.id,
+            "thread_id": consultation.thread_id,
+            "answer": answer,
+            "tool_calls": tool_calls,
+            "messages": [_message_as_dict(message) for message in messages],
+        }
 
     def append_message(self, consultation_id: str, role: str, content: str) -> None:
         self.repository.append_message(consultation_id, Message(role, content))
