@@ -29,7 +29,11 @@ from .providers import (
 from .planning import MockPlanningModel, run_planning_graph
 from .planning_revision import parse_planning_revision
 from .agent import AgentSettings, create_agent_app, load_agent_settings
-from langgraph.checkpoint.sqlite import SqliteSaver
+from .langchain_tools import create_travel_tools
+from .provider_factory import ProviderSettings
+from langchain_core.messages import RemoveMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 
 def _last_message_content(messages: list[Any]) -> str:
@@ -50,6 +54,25 @@ def _message_as_dict(message: Any) -> dict[str, Any]:
         "content": getattr(message, "content", ""),
         "tool_calls": getattr(message, "tool_calls", []),
     }
+
+
+def _tool_history_status(messages: list[Any]) -> str:
+    """Classify OpenAI tool-call ordering as complete, pending, or invalid."""
+    pending: set[str] = set()
+    for message in messages:
+        message_type = getattr(message, "type", None)
+        if pending:
+            if message_type != "tool":
+                return "invalid"
+            tool_call_id = getattr(message, "tool_call_id", None)
+            if tool_call_id not in pending:
+                return "invalid"
+            pending.remove(tool_call_id)
+            continue
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if tool_calls:
+            pending = {call["id"] for call in tool_calls if call.get("id")}
+    return "pending" if pending else "complete"
 
 
 class ConsultationService:
@@ -110,21 +133,61 @@ class ConsultationService:
             api_key=api_key or loaded.api_key,
             base_url=base_url or loaded.base_url,
         )
-        with SqliteSaver.from_conn_string(str(self.checkpoint_path)) as checkpointer:
-            agent = create_agent_app(
-                self.repository.database_path,
-                settings,
-                checkpointer=checkpointer,
-            )
-            config = {"configurable": {"thread_id": consultation.thread_id}}
-            if checkpointer.get_tuple(config) is None:
-                input_messages = [
-                    {"role": message.role, "content": message.content}
-                    for message in self.get_consultation(consultation_id).messages
-                ]
-            else:
-                input_messages = [{"role": "user", "content": user_message}]
-            result = agent.invoke({"messages": input_messages}, config=config)
+        provider_settings = ProviderSettings.from_env()
+        tools = create_travel_tools(
+            self.repository.database_path,
+            provider_settings=provider_settings,
+        )
+        async def run_chat():
+            async with AsyncSqliteSaver.from_conn_string(
+                str(self.checkpoint_path)
+            ) as checkpointer:
+                agent = create_agent_app(
+                    self.repository.database_path,
+                    settings,
+                    checkpointer=checkpointer,
+                    tools=tools,
+                )
+                config = {"configurable": {"thread_id": consultation.thread_id}}
+                checkpoint = await checkpointer.aget_tuple(config)
+                if checkpoint is None:
+                    input_messages = [
+                        {"role": message.role, "content": message.content}
+                        for message in self.get_consultation(consultation_id).messages
+                    ]
+                    return await agent.ainvoke(
+                        {"messages": input_messages}, config=config
+                    )
+
+                state = await agent.aget_state(config)
+                history_status = _tool_history_status(
+                    list(state.values.get("messages", []))
+                )
+                if history_status == "pending" and state.next:
+                    await agent.ainvoke(None, config=config)
+                elif history_status == "invalid":
+                    business_messages = [
+                        {"role": message.role, "content": message.content}
+                        for message in self.get_consultation(consultation_id).messages
+                    ]
+                    await agent.aupdate_state(
+                        config,
+                        {
+                            "messages": [
+                                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                                *business_messages,
+                            ]
+                        },
+                        as_node="__start__",
+                    )
+                    return await agent.ainvoke(None, config=config)
+
+                return await agent.ainvoke(
+                    {"messages": [{"role": "user", "content": user_message}]},
+                    config=config,
+                )
+
+        result = asyncio.run(run_chat())
         messages = result.get("messages", [])
         answer = _last_message_content(messages)
         tool_calls = [

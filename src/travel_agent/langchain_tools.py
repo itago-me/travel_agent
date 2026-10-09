@@ -4,23 +4,28 @@ from pathlib import Path
 
 from langchain_core.tools import StructuredTool
 
+from .flyai_client import FlyAIClient
+from .provider_factory import ProviderSettings, create_provider_bundle
 from .providers import (
     AttractionSearchRequest,
     HotelSearchRequest,
     TransportSearchRequest,
 )
-from .sqlite_providers import (
-    SQLiteAttractionProvider,
-    SQLiteHotelProvider,
-    SQLiteTransportProvider,
-)
-
-
-def create_travel_tools(database: str | Path) -> list[StructuredTool]:
+def create_travel_tools(
+    database: str | Path,
+    provider_settings: ProviderSettings | None = None,
+    *,
+    flyai_client: FlyAIClient | None = None,
+) -> list[StructuredTool]:
     """Build tools the Agent can bind; each tool returns JSON-ready data."""
-    transport = SQLiteTransportProvider(database)
-    hotel = SQLiteHotelProvider(database)
-    attraction = SQLiteAttractionProvider(database)
+    providers = create_provider_bundle(
+        database,
+        provider_settings,
+        flyai_client=flyai_client,
+    )
+    transport = providers.transport
+    hotel = providers.hotel
+    attraction = providers.attraction
 
     async def search_transport(**kwargs):
         result = await transport.search(TransportSearchRequest.model_validate(kwargs))

@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .flyai_client import FlyAIClient
+from .provider_factory import ProviderSettings
+
 
 @dataclass(frozen=True)
 class AgentSettings:
@@ -36,7 +39,6 @@ def load_agent_settings(env_file: str | Path | None = None) -> AgentSettings:
     )
 
 
-
 def _import_chat_openai():
     try:
         return importlib.import_module("langchain_openai").ChatOpenAI
@@ -56,6 +58,9 @@ def create_agent_app(
     settings: AgentSettings | None = None,
     *,
     checkpointer: Any | None = None,
+    provider_settings: ProviderSettings | None = None,
+    flyai_client: FlyAIClient | None = None,
+    tools: list[Any] | None = None,
 ):
     """Create the production Agent using LangChain's official factory."""
     settings = settings or load_agent_settings()
@@ -81,9 +86,16 @@ def create_agent_app(
     model = chat_openai(**model_kwargs)
     from .langchain_tools import create_travel_tools
 
+    provider_settings = provider_settings or ProviderSettings.from_env()
+    if tools is None:
+        tools = create_travel_tools(
+            database,
+            provider_settings=provider_settings,
+            flyai_client=flyai_client,
+        )
     agent_kwargs: dict[str, Any] = {
         "model": model,
-        "tools": create_travel_tools(database),
+        "tools": tools,
         "system_prompt": (
             "你是中国境内旅行顾问 Copilot。"
             "先理解顾问需求，必要时调用旅行查询工具；"

@@ -34,6 +34,11 @@ class TransportOption(ProviderModel):
     arrival_time: time
     duration_minutes: int = Field(gt=0)
     total_price: float = Field(ge=0)
+    vehicle_type: str | None = None
+    carrier: str | None = None
+    service_number: str | None = None
+    seat_class: str | None = None
+    booking_url: str | None = None
 
 
 class TransportSearchResult(ProviderModel):
@@ -57,11 +62,21 @@ class HotelSearchRequest(ProviderModel):
 class HotelOption(ProviderModel):
     provider: str = Field(min_length=1)
     option_id: str = Field(min_length=1)
+    hotel_id: str | None = None
     name: str = Field(min_length=1)
     city: str = Field(min_length=1)
-    price_per_night: float = Field(ge=0)
-    rating: float = Field(ge=0, le=5)
-    available_rooms: int = Field(ge=0)
+    address: str | None = None
+    brand_name: str | None = None
+    hotel_type: str | None = None
+    price_per_night: float | None = Field(default=None, ge=0)
+    currency: str | None = None
+    rating: float | None = Field(default=None, ge=0, le=5)
+    available_rooms: int | None = Field(default=None, ge=0)
+    image_url: str | None = None
+    detail_url: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    nearby_poi: str | None = None
 
 
 class HotelSearchResult(ProviderModel):
@@ -80,8 +95,14 @@ class AttractionOption(ProviderModel):
     name: str = Field(min_length=1)
     city: str = Field(min_length=1)
     visit_date: date
-    duration_minutes: int = Field(gt=0)
-    ticket_price: float = Field(ge=0)
+    address: str | None = None
+    duration_minutes: int | None = Field(default=None, gt=0)
+    ticket_price: float | None = Field(default=None, ge=0)
+    currency: str | None = None
+    ticket_name: str | None = None
+    free_status: str | None = None
+    image_url: str | None = None
+    booking_url: str | None = None
 
 
 class AttractionSearchResult(ProviderModel):
