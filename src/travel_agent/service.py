@@ -4,7 +4,7 @@ from typing import Any
 from uuid import uuid4
 from pathlib import Path
 
-from .domain import AuditEvent, Consultation, Message
+from .domain import AuditEvent, Consultation, CustomerPreference, Message
 from .mock_model import MockAgentModel
 from .requirement_extractor import extract_requirements
 from .requirements import TripRequirements
@@ -90,14 +90,21 @@ class ConsultationService:
         )
 
     def create_consultation(
-        self, consultant_id: str, customer_name: str, initial_message: str
+        self,
+        consultant_id: str,
+        customer_name: str,
+        initial_message: str,
+        *,
+        customer_id: str | None = None,
     ) -> Consultation:
+        customer_id = customer_id or f"legacy:{customer_name}"
         consultation = Consultation(
             id=str(uuid4()),
             thread_id=str(uuid4()),
             consultant_id=consultant_id,
             customer_name=customer_name,
             status="OPEN",
+            customer_id=customer_id,
             messages=[Message("user", initial_message)],
         )
         self.repository.create_consultation(consultation)
@@ -105,13 +112,38 @@ class ConsultationService:
             AuditEvent(
                 consultation_id=consultation.id,
                 event_type="CONSULTATION_CREATED",
-                details={"consultant_id": consultant_id, "thread_id": consultation.thread_id},
+                details={
+                    "consultant_id": consultant_id,
+                    "customer_id": consultation.customer_id,
+                    "thread_id": consultation.thread_id,
+                },
             )
         )
         return consultation
 
     def get_consultation(self, consultation_id: str) -> Consultation:
         return self.repository.get_consultation(consultation_id)
+
+    def set_customer_preference(
+        self,
+        customer_id: str,
+        preference_key: str,
+        value: Any,
+        *,
+        source: str = "explicit",
+    ) -> CustomerPreference:
+        return self.repository.set_customer_preference(
+            customer_id,
+            preference_key,
+            value,
+            source=source,
+        )
+
+    def list_customer_preferences(self, customer_id: str) -> list[CustomerPreference]:
+        return self.repository.list_customer_preferences(customer_id)
+
+    def delete_customer_preference(self, customer_id: str, preference_key: str) -> bool:
+        return self.repository.delete_customer_preference(customer_id, preference_key)
 
     def chat_consultation(
         self,
@@ -126,6 +158,11 @@ class ConsultationService:
         """Run one real model/tool turn for a consultation."""
         consultation = self.get_consultation(consultation_id)
         self.append_message(consultation_id, "user", user_message)
+        current_requirements = extract_requirements(user_message)
+        trip_requirements = dict(consultation.trip_requirements)
+        for message in self.get_consultation(consultation_id).messages:
+            if message.role == "user":
+                trip_requirements.update(extract_requirements(message.content))
         loaded = load_agent_settings(env_file)
         settings = AgentSettings(
             model_mode=loaded.model_mode,
@@ -138,25 +175,52 @@ class ConsultationService:
             self.repository.database_path,
             provider_settings=provider_settings,
         )
+
         async def run_chat():
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
+                config = {"configurable": {"thread_id": consultation.thread_id}}
+                checkpoint = await checkpointer.aget_tuple(config)
+                # Read once per new thread, before constructing the Agent.
+                # Existing checkpoints predating 4.4 get their snapshot on next chat.
+                saved_values = getattr(checkpoint, "checkpoint", {}).get(
+                    "channel_values", {}
+                )
+                needs_snapshot = checkpoint is None or (
+                    hasattr(checkpoint, "checkpoint")
+                    and "customer_preferences" not in saved_values
+                )
+                preference_state = {}
+                if needs_snapshot:
+                    preference_state = {
+                        "customer_id": consultation.customer_id,
+                        "customer_preferences": {
+                            preference.preference_key: preference.value
+                            for preference in self.list_customer_preferences(
+                                consultation.customer_id
+                            )
+                        },
+                    }
+                turn_state = {
+                    "current_trip_requirements": current_requirements,
+                    **preference_state,
+                }
+                if trip_requirements:
+                    turn_state["trip_requirements"] = trip_requirements
                 agent = create_agent_app(
                     self.repository.database_path,
                     settings,
                     checkpointer=checkpointer,
                     tools=tools,
                 )
-                config = {"configurable": {"thread_id": consultation.thread_id}}
-                checkpoint = await checkpointer.aget_tuple(config)
                 if checkpoint is None:
                     input_messages = [
                         {"role": message.role, "content": message.content}
                         for message in self.get_consultation(consultation_id).messages
                     ]
                     return await agent.ainvoke(
-                        {"messages": input_messages}, config=config
+                        {"messages": input_messages, **turn_state}, config=config
                     )
 
                 state = await agent.aget_state(config)
@@ -173,19 +237,20 @@ class ConsultationService:
                     await agent.aupdate_state(
                         config,
                         {
+                            **turn_state,
                             "messages": [
                                 RemoveMessage(id=REMOVE_ALL_MESSAGES),
                                 *business_messages,
-                            ]
+                            ],
                         },
                         as_node="__start__",
                     )
                     return await agent.ainvoke(None, config=config)
 
-                return await agent.ainvoke(
-                    {"messages": [{"role": "user", "content": user_message}]},
-                    config=config,
-                )
+                next_input = {"messages": [{"role": "user", "content": user_message}]}
+                if history_status != "pending" or current_requirements:
+                    next_input.update(turn_state)
+                return await agent.ainvoke(next_input, config=config)
 
         result = asyncio.run(run_chat())
         messages = result.get("messages", [])
@@ -237,7 +302,9 @@ class ConsultationService:
             )
         )
 
-    def resume_consultation(self, consultation_id: str, user_message: str) -> dict[str, Any]:
+    def resume_consultation(
+        self, consultation_id: str, user_message: str
+    ) -> dict[str, Any]:
         consultation = self.get_consultation(consultation_id)
         self.append_message(consultation_id, "user", user_message)
 
@@ -280,9 +347,7 @@ class ConsultationService:
         requirements = TripRequirements(**consultation.trip_requirements)
         missing_fields = requirements.missing_fields()
         if missing_fields:
-            raise ValueError(
-                f"旅行需求不完整，缺少字段: {', '.join(missing_fields)}"
-            )
+            raise ValueError(f"旅行需求不完整，缺少字段: {', '.join(missing_fields)}")
 
         def persist_tool_audit(event: ToolAuditEvent) -> None:
             self.repository.add_audit_event(
@@ -503,9 +568,10 @@ class ConsultationService:
         if "budget" in revision:
             requirements["budget"] = revision["budget"]
             self.update_requirements(consultation_id, requirements)
-        constraints = {**consultation.planning_constraints, **{
-            key: value for key, value in revision.items() if key != "budget"
-        }}
+        constraints = {
+            **consultation.planning_constraints,
+            **{key: value for key, value in revision.items() if key != "budget"},
+        }
         if revision:
             self.repository.update_planning_constraints(consultation_id, constraints)
             self.repository.add_audit_event(
@@ -543,7 +609,14 @@ class ConsultationService:
             AuditEvent(
                 consultation_id=consultation_id,
                 event_type="ITINERARY_SELECTED",
-                details={"version_id": version_id, "version_number": version["version_number"]},
+                details={
+                    "version_id": version_id,
+                    "version_number": version["version_number"],
+                },
             )
         )
-        return {"version_id": version_id, "version_number": version["version_number"], "payload": version["payload"]}
+        return {
+            "version_id": version_id,
+            "version_number": version["version_number"],
+            "payload": version["payload"],
+        }

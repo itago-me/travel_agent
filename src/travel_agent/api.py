@@ -10,6 +10,7 @@ from .domain import Consultation
 
 class CreateConsultationRequest(BaseModel):
     consultant_id: str = Field(min_length=1)
+    customer_id: str | None = Field(default=None, min_length=1)
     customer_name: str = Field(min_length=1)
     initial_message: str = Field(min_length=1)
 
@@ -18,6 +19,7 @@ class ConsultationResponse(BaseModel):
     consultation_id: str
     thread_id: str
     consultant_id: str
+    customer_id: str
     customer_name: str
     status: str
     messages: list[dict[str, str]]
@@ -29,6 +31,7 @@ class ConsultationResponse(BaseModel):
             consultation_id=consultation.id,
             thread_id=consultation.thread_id,
             consultant_id=consultation.consultant_id,
+            customer_id=consultation.customer_id,
             customer_name=consultation.customer_name,
             status=consultation.status,
             messages=[message.as_dict() for message in consultation.messages],
@@ -50,6 +53,7 @@ def create_app(database_path: str | Path = "data/travel_agent.db") -> FastAPI:
             request.consultant_id,
             request.customer_name,
             request.initial_message,
+            customer_id=request.customer_id,
         )
         return ConsultationResponse.from_domain(consultation)
 

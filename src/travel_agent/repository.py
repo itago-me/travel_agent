@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .domain import AuditEvent, Consultation, Message, utc_now
+from .domain import AuditEvent, Consultation, CustomerPreference, Message, utc_now
 
 
 class SQLiteRepository:
@@ -26,6 +26,7 @@ class SQLiteRepository:
                     id TEXT PRIMARY KEY,
                     thread_id TEXT NOT NULL UNIQUE,
                     consultant_id TEXT NOT NULL,
+                    customer_id TEXT NOT NULL DEFAULT '',
                     customer_name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     trip_requirements TEXT NOT NULL,
@@ -78,12 +79,25 @@ class SQLiteRepository:
                     FOREIGN KEY (consultation_id) REFERENCES consultations(id),
                     FOREIGN KEY (version_id) REFERENCES itinerary_versions(id)
                 );
+                CREATE TABLE IF NOT EXISTS customer_preferences (
+                    customer_id TEXT NOT NULL,
+                    preference_key TEXT NOT NULL,
+                    preference_value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (customer_id, preference_key)
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(consultations)")}
             if "planning_constraints" not in columns:
                 connection.execute(
                     "ALTER TABLE consultations ADD COLUMN planning_constraints TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "customer_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE consultations ADD COLUMN customer_id TEXT NOT NULL DEFAULT ''"
                 )
             draft_columns = {row[1] for row in connection.execute("PRAGMA table_info(itinerary_drafts)")}
             if "selected_version_id" not in draft_columns:
@@ -96,14 +110,15 @@ class SQLiteRepository:
             connection.execute(
                 """
                 INSERT INTO consultations
-                    (id, thread_id, consultant_id, customer_name, status,
-                     trip_requirements, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, thread_id, consultant_id, customer_id, customer_name,
+                     status, trip_requirements, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     consultation.id,
                     consultation.thread_id,
                     consultation.consultant_id,
+                    consultation.customer_id,
                     consultation.customer_name,
                     consultation.status,
                     json.dumps(consultation.trip_requirements, ensure_ascii=False),
@@ -131,6 +146,7 @@ class SQLiteRepository:
             consultant_id=row["consultant_id"],
             customer_name=row["customer_name"],
             status=row["status"],
+            customer_id=row["customer_id"] or f"legacy:{row['customer_name']}",
             messages=[Message(item["role"], item["content"]) for item in messages],
             trip_requirements=json.loads(row["trip_requirements"]),
             planning_constraints=json.loads(row["planning_constraints"]),
@@ -178,6 +194,94 @@ class SQLiteRepository:
                 ),
             )
 
+    def set_customer_preference(
+        self,
+        customer_id: str,
+        preference_key: str,
+        value: Any,
+        *,
+        source: str = "explicit",
+    ) -> CustomerPreference:
+        customer_id = customer_id.strip()
+        preference_key = preference_key.strip()
+        source = source.strip()
+        if not customer_id:
+            raise ValueError("customer_id must not be empty")
+        if not preference_key:
+            raise ValueError("preference_key must not be empty")
+        if not source:
+            raise ValueError("source must not be empty")
+        encoded_value = json.dumps(value, ensure_ascii=False)
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO customer_preferences (
+                    customer_id, preference_key, preference_value,
+                    source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(customer_id, preference_key) DO UPDATE SET
+                    preference_value = excluded.preference_value,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    customer_id,
+                    preference_key,
+                    encoded_value,
+                    source,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM customer_preferences
+                WHERE customer_id = ? AND preference_key = ?
+                """,
+                (customer_id, preference_key),
+            ).fetchone()
+        return self._customer_preference_from_row(row)
+
+    def get_customer_preference(
+        self, customer_id: str, preference_key: str
+    ) -> CustomerPreference | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM customer_preferences
+                WHERE customer_id = ? AND preference_key = ?
+                """,
+                (customer_id, preference_key),
+            ).fetchone()
+        return self._customer_preference_from_row(row) if row is not None else None
+
+    def list_customer_preferences(
+        self, customer_id: str
+    ) -> list[CustomerPreference]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM customer_preferences
+                WHERE customer_id = ? ORDER BY preference_key
+                """,
+                (customer_id,),
+            ).fetchall()
+        return [self._customer_preference_from_row(row) for row in rows]
+
+    def delete_customer_preference(
+        self, customer_id: str, preference_key: str
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM customer_preferences
+                WHERE customer_id = ? AND preference_key = ?
+                """,
+                (customer_id, preference_key),
+            )
+        return cursor.rowcount > 0
+
     def list_audit_events(self, consultation_id: str) -> list[AuditEvent]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -193,6 +297,17 @@ class SQLiteRepository:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _customer_preference_from_row(row: sqlite3.Row) -> CustomerPreference:
+        return CustomerPreference(
+            customer_id=row["customer_id"],
+            preference_key=row["preference_key"],
+            value=json.loads(row["preference_value"]),
+            source=row["source"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     def save_itinerary_version(
         self,

@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = subparsers.add_parser("start")
     start.add_argument("--consultant-id", required=True)
+    start.add_argument("--customer-id")
     start.add_argument("--customer-name", required=True)
     start.add_argument("--message", required=True)
 
@@ -61,11 +62,25 @@ def build_parser() -> argparse.ArgumentParser:
     select = subparsers.add_parser("select-itinerary")
     select.add_argument("consultation_id")
     select.add_argument("version_id")
+
+    preferences = subparsers.add_parser("preferences")
+    preferences.add_argument("customer_id")
+
+    set_preference = subparsers.add_parser("set-preference")
+    set_preference.add_argument("customer_id")
+    set_preference.add_argument("preference_key")
+    set_preference.add_argument("--value-json", required=True)
+    set_preference.add_argument("--source", default="explicit")
+
+    delete_preference = subparsers.add_parser("delete-preference")
+    delete_preference.add_argument("customer_id")
+    delete_preference.add_argument("preference_key")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     service = create_consultation_service(
         Path(args.database),
         Path(args.checkpoint_database) if args.checkpoint_database else None,
@@ -89,14 +104,55 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "start":
         consultation = service.create_consultation(
-            args.consultant_id, args.customer_name, args.message
+            args.consultant_id,
+            args.customer_name,
+            args.message,
+            customer_id=args.customer_id,
         )
         print(
             json.dumps(
                 {
                     "consultation_id": consultation.id,
                     "thread_id": consultation.thread_id,
+                    "customer_id": consultation.customer_id,
                 }
+            )
+        )
+        return 0
+    if args.command == "preferences":
+        preferences = service.list_customer_preferences(args.customer_id)
+        print(
+            json.dumps(
+                [preference.as_dict() for preference in preferences],
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    if args.command == "set-preference":
+        try:
+            value = json.loads(args.value_json)
+        except json.JSONDecodeError:
+            parser.error("--value-json 必须是有效 JSON")
+        preference = service.set_customer_preference(
+            args.customer_id,
+            args.preference_key,
+            value,
+            source=args.source,
+        )
+        print(json.dumps(preference.as_dict(), ensure_ascii=False))
+        return 0
+    if args.command == "delete-preference":
+        deleted = service.delete_customer_preference(
+            args.customer_id, args.preference_key
+        )
+        print(
+            json.dumps(
+                {
+                    "customer_id": args.customer_id,
+                    "preference_key": args.preference_key,
+                    "deleted": deleted,
+                },
+                ensure_ascii=False,
             )
         )
         return 0
@@ -162,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "consultation_id": consultation.id,
                 "thread_id": consultation.thread_id,
+                "customer_id": consultation.customer_id,
                 "customer_name": consultation.customer_name,
                 "status": consultation.status,
                 "messages": [message.as_dict() for message in consultation.messages],
