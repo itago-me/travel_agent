@@ -47,6 +47,10 @@ def create_provider_bundle(
     flyai_client: FlyAIClient | None = None,
 ) -> ProviderBundle:
     settings = settings or ProviderSettings.from_env()
+    # 三个 provider 必须共用同一个 FlyAIClient：限流按上游账号计，
+    # 各建各的 client 就没有全局并发闸门，一轮并行工具调用会直接撞 429。
+    if flyai_client is None and "flyai" in (settings.hotel, settings.transport, settings.attraction):
+        flyai_client = FlyAIClient()
     return ProviderBundle(
         hotel=_create_one("hotel", settings.hotel, database, flyai_client),
         transport=_create_one("transport", settings.transport, database, flyai_client),

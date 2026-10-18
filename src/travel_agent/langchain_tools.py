@@ -11,6 +11,15 @@ from .providers import (
     HotelSearchRequest,
     TransportSearchRequest,
 )
+from .booking import (
+    CancelMockBookingRequest,
+    CancelMockBookingResult,
+    CreateMockBookingRequest,
+    CreateMockBookingResult,
+)
+from .repository import SQLiteRepository
+
+
 def create_travel_tools(
     database: str | Path,
     provider_settings: ProviderSettings | None = None,
@@ -57,5 +66,61 @@ def create_travel_tools(
             name="search_attractions",
             description="查询指定城市和游览日期的景点选项。",
             args_schema=AttractionSearchRequest,
+        ),
+    ]
+
+
+def create_sensitive_booking_tools(database: str | Path) -> list[StructuredTool]:
+    """Build booking tools that must be paired with HITL before Agent exposure."""
+    repository = SQLiteRepository(database)
+
+    async def create_booking(**kwargs):
+        request = CreateMockBookingRequest.model_validate(kwargs)
+        booking = repository.create_mock_booking(
+            request.consultation_id,
+            request.itinerary_version_id,
+            total_amount=request.total_amount,
+            idempotency_key=request.idempotency_key,
+        )
+        return CreateMockBookingResult(
+            booking_id=booking.id,
+            consultation_id=booking.consultation_id,
+            itinerary_version_id=booking.itinerary_version_id,
+            total_amount=booking.total_amount,
+            status=booking.status.value,
+            idempotency_key=booking.idempotency_key,
+        ).model_dump(mode="json")
+
+    async def cancel_booking(**kwargs):
+        request = CancelMockBookingRequest.model_validate(kwargs)
+        booking = repository.cancel_mock_booking(
+            request.consultation_id,
+            request.booking_id,
+            reason=request.reason,
+            idempotency_key=request.idempotency_key,
+        )
+        return CancelMockBookingResult(
+            booking_id=booking.id,
+            consultation_id=booking.consultation_id,
+            status=booking.status.value,
+            cancellation_reason=booking.cancellation_reason or "",
+            idempotency_key=booking.cancellation_idempotency_key or "",
+        ).model_dump(mode="json")
+
+    metadata = {"permission": "SENSITIVE", "requires_human_approval": True}
+    return [
+        StructuredTool.from_function(
+            coroutine=create_booking,
+            name="create_mock_booking",
+            description="为已确认的旅行方案创建模拟预订。执行前必须获得人工审批。",
+            args_schema=CreateMockBookingRequest,
+            metadata=metadata,
+        ),
+        StructuredTool.from_function(
+            coroutine=cancel_booking,
+            name="cancel_mock_booking",
+            description="取消已有模拟预订。执行前必须获得人工审批。",
+            args_schema=CancelMockBookingRequest,
+            metadata=metadata,
         ),
     ]

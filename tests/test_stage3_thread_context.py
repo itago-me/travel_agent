@@ -151,7 +151,10 @@ def test_chat_builds_travel_tools_and_explicitly_injects_them_into_agent(
     assert captured["provider_settings"].transport == "flyai"
     assert captured["provider_settings"].attraction == "flyai"
     assert captured["agent_database"] == repository.database_path
-    assert captured["agent_tools"] is tools
+    assert captured["agent_tools"][:3] == tools
+    assert {tool.name for tool in captured["agent_tools"][3:]} == {
+        "create_mock_booking", "cancel_mock_booking"
+    }
 
 
 def test_tool_history_status_detects_pending_and_invalid_sequences():
@@ -261,5 +264,56 @@ def test_chat_resumes_pending_tool_before_submitting_new_user_message(
 
     assert calls[0][0] is None
     assert calls[1][0] == {
-        "messages": [{"role": "user", "content": "继续查询"}]
+        "messages": [{"role": "user", "content": "继续查询"}],
+        # 版本列表每轮重发，保证模型不会拿到过期版本 id
+        "itinerary_versions": [],
+        "selected_itinerary_version_id": None,
     }
+
+
+def test_每轮都把最新版本列表送给模型(monkeypatch, tmp_path):
+    """版本列表必须每轮重发。
+
+    回归背景：最初只把版本信息塞进 ``turn_state``，而该字典仅在
+    ``history_status != "pending"`` 时随输入下发。多轮对话恰好走的是 pending
+    分支，于是模型一直看到旧列表，最终拿着过期版本 id 去下单。
+    """
+    repository = SQLiteRepository(tmp_path / "travel.db")
+    service = ConsultationService(repository, checkpoint_path=tmp_path / "checkpoints.sqlite")
+    consultation = service.create_consultation("consultant-1", "张先生", "我想去杭州玩 4 天")
+
+    version_one, _ = repository.save_itinerary_version(
+        consultation.id, {"budget": {"total": 2790}}, [], {}
+    )
+    calls = []
+    checkpointer = FakeCheckpointer()
+    monkeypatch.setattr(
+        "travel_agent.service.create_agent_app",
+        lambda *a, **k: FakeAgent(calls, checkpointer),
+    )
+    monkeypatch.setattr(
+        "travel_agent.service.AsyncSqliteSaver.from_conn_string",
+        lambda _p: FakeCheckpointerContext(checkpointer),
+    )
+    monkeypatch.setattr(
+        "travel_agent.service.load_agent_settings",
+        lambda *_: SimpleNamespace(
+            model_mode="openai_compatible", model_name="demo", api_key=None, base_url=None
+        ),
+    )
+
+    service.chat_consultation(consultation.id, "先看看方案")
+    # 第二轮开始前新增版本并选定，模拟顾问的操作
+    version_two, _ = repository.save_itinerary_version(
+        consultation.id, {"budget": {"total": 2640}}, [], {}
+    )
+    repository.select_itinerary_version(consultation.id, version_two)
+    service.chat_consultation(consultation.id, "那就下单吧")
+
+    first_state, second_state = calls[0][0], calls[1][0]
+    assert first_state["itinerary_versions"][0]["id"] == version_one
+    assert first_state["selected_itinerary_version_id"] is None
+
+    # 第二轮必须看到两个版本，且选定状态已更新
+    assert [v["id"] for v in second_state["itinerary_versions"]] == [version_one, version_two]
+    assert second_state["selected_itinerary_version_id"] == version_two

@@ -191,6 +191,8 @@ def test_create_agent_receives_flyai_backed_tools(monkeypatch, tmp_path):
         "search_transport_options",
         "search_hotel_options",
         "search_attractions",
+        "create_mock_booking",
+        "cancel_mock_booking",
     }
     assert observation["provider"] == "flyai_fliggy"
     assert [call[0] for call in client.calls] == ["hotel"]

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from .flyai_client import FlyAIClient
 from .flyai_parsers import (
     parse_attraction_response,

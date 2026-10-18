@@ -22,9 +22,15 @@ def test_create_consultation_persists_thread_and_audit_event(tmp_path):
     assert [message.as_dict() for message in restored.messages] == [
         {"role": "user", "content": "我想去杭州旅游"}
     ]
+    # The opening message is parsed for explicit requirements right away, so later
+    # turns (and the itinerary version built from their search results) have them.
+    assert restored.trip_requirements == {"destination": "杭州"}
 
     events = repository.list_audit_events(consultation.id)
-    assert [event.event_type for event in events] == ["CONSULTATION_CREATED"]
+    assert [event.event_type for event in events] == [
+        "CONSULTATION_CREATED",
+        "REQUIREMENTS_EXTRACTED",
+    ]
 
 
 def test_append_message_updates_thread_and_creates_audit_event(tmp_path):
@@ -44,9 +50,11 @@ def test_append_message_updates_thread_and_creates_audit_event(tmp_path):
     events = repository.list_audit_events(consultation.id)
     assert [event.event_type for event in events] == [
         "CONSULTATION_CREATED",
+        "REQUIREMENTS_EXTRACTED",
         "MESSAGE_APPENDED",
         "MESSAGE_APPENDED",
     ]
+    assert restored.trip_requirements == {"destination": "成都"}
 
 
 def test_update_requirements_persists_structured_trip_requirements(tmp_path):

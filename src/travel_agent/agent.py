@@ -91,7 +91,9 @@ def create_agent_app(
     if create_agent is None:
         raise RuntimeError("请先安装完整 langchain，才能使用 create_agent。")
     model = create_chat_model(settings)
-    from .langchain_tools import create_travel_tools
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+    from .langchain_tools import create_sensitive_booking_tools, create_travel_tools
     from .agent_context import (
         ContextWindowMiddleware,
         TravelMemoryMiddleware,
@@ -107,11 +109,14 @@ def create_agent_app(
 
     provider_settings = provider_settings or ProviderSettings.from_env()
     if tools is None:
-        tools = create_travel_tools(
-            database,
-            provider_settings=provider_settings,
-            flyai_client=flyai_client,
-        )
+        tools = [
+            *create_travel_tools(
+                database,
+                provider_settings=provider_settings,
+                flyai_client=flyai_client,
+            ),
+            *create_sensitive_booking_tools(database),
+        ]
     agent_kwargs: dict[str, Any] = {
         "model": model,
         "tools": tools,
@@ -126,11 +131,25 @@ def create_agent_app(
                 max_messages=_positive_env("TRAVEL_AGENT_CONTEXT_MAX_MESSAGES", 12),
                 max_tokens=_positive_env("TRAVEL_AGENT_CONTEXT_MAX_TOKENS", 4000),
             ),
+            HumanInTheLoopMiddleware(
+                interrupt_on={
+                    "create_mock_booking": {
+                        "allowed_decisions": ["approve", "edit", "reject"]
+                    },
+                    "cancel_mock_booking": {
+                        "allowed_decisions": ["approve", "edit", "reject"]
+                    },
+                },
+                description_prefix="敏感旅行操作需要顾问审批",
+            ),
         ],
         "system_prompt": (
             "你是中国境内旅行顾问 Copilot。"
             "先理解顾问需求，必要时调用旅行查询工具；"
             "根据工具返回的结构化结果，用中文给出清晰、可核验的建议。"
+            "仅在顾问明确要求时申请创建或取消模拟预订；"
+            "创建前必须有已选择的方案版本，不得编造咨询、方案或订单 ID。"
+            "敏感工具会暂停等待人工审批，提出申请不代表订单已经创建或取消。"
         ),
     }
     if checkpointer is not None:

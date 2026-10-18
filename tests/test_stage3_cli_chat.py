@@ -129,6 +129,8 @@ def test_cli_chat_passes_factory_tools_to_agent_and_reports_tool_call(
         "search_transport_options",
         "search_hotel_options",
         "search_attractions",
+        "create_mock_booking",
+        "cancel_mock_booking",
     }
 
 

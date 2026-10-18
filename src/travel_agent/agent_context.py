@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, NotRequired
 
@@ -23,6 +23,8 @@ class TravelAgentState(AgentState):
     customer_preferences: NotRequired[dict[str, Any]]
     current_trip_requirements: NotRequired[dict[str, Any]]
     trip_requirements: NotRequired[dict[str, Any]]
+    itinerary_versions: NotRequired[list[dict[str, Any]]]
+    selected_itinerary_version_id: NotRequired[str | None]
     structured_summary: NotRequired[dict[str, Any]]
     conversation_summary: NotRequired[str]
     summarized_message_count: NotRequired[int]
@@ -99,6 +101,8 @@ class TravelMemoryContext:
     current_requirements: dict[str, Any]
     structured_summary: dict[str, Any]
     conversation_summary: str
+    itinerary_versions: list[dict[str, Any]] = field(default_factory=list)
+    selected_itinerary_version_id: str | None = None
 
 
 def build_memory_context(state: dict[str, Any]) -> TravelMemoryContext:
@@ -109,7 +113,43 @@ def build_memory_context(state: dict[str, Any]) -> TravelMemoryContext:
         current_requirements=current,
         structured_summary=state.get("structured_summary", {}),
         conversation_summary=state.get("conversation_summary", ""),
+        itinerary_versions=list(state.get("itinerary_versions") or []),
+        selected_itinerary_version_id=state.get("selected_itinerary_version_id"),
     )
+
+
+def _render_itinerary_versions(memory: TravelMemoryContext) -> str:
+    """Render the version list so the model cannot pick a stale version id.
+
+    Without this the model only sees version ids that happen to appear in the
+    conversation, so after several chat turns it tends to reuse the first one it
+    saw. ``create_mock_booking`` then fails because that version is not the
+    selected one.
+    """
+    if not memory.itinerary_versions:
+        return ""
+    lines = ["\n可选方案版本（供 create_mock_booking 使用，务必使用这里的 id）："]
+    for version in memory.itinerary_versions:
+        payload = version.get("payload") or {}
+        budget = payload.get("budget") or {}
+        total = budget.get("total")
+        is_selected = version.get("id") == memory.selected_itinerary_version_id
+        marks = " ← 已选定" if is_selected else ""
+        amount = f"预算合计 {total}" if total is not None else "预算未确定"
+        lines.append(
+            f"- v{version.get('version_number')} id={version.get('id')} {amount}{marks}"
+        )
+    if memory.selected_itinerary_version_id:
+        lines.append(
+            "已知当前选定版本 id=" + str(memory.selected_itinerary_version_id) + "。"
+            "create_mock_booking 只能使用已选定的版本，否则会被拒绝。"
+        )
+    else:
+        lines.append(
+            "当前没有任何已选定版本。create_mock_booking 会失败，"
+            "必须先由顾问执行 select-itinerary 选定一个版本。"
+        )
+    return "\n".join(lines)
 
 
 class TravelMemoryMiddleware(AgentMiddleware):
@@ -178,6 +218,7 @@ class TravelMemoryMiddleware(AgentMiddleware):
                 memory.current_requirements,
                 memory.structured_summary,
                 memory.conversation_summary,
+                memory.itinerary_versions,
             )
         ):
             return request
@@ -193,6 +234,7 @@ class TravelMemoryMiddleware(AgentMiddleware):
             + json.dumps(memory.structured_summary, ensure_ascii=False)
             + "\n自然语言会话摘要："
             + memory.conversation_summary
+            + _render_itinerary_versions(memory)
         )
         original = request.system_message
         content = original.content if original else ""

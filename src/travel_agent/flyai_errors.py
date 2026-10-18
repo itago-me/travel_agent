@@ -14,6 +14,10 @@ class FlyAIUnavailableError(FlyAIError):
     pass
 
 
+class FlyAIRateLimitError(FlyAIUnavailableError):
+    """FlyAI 上游限流（HTTP 429）。属于可恢复错误，应当退避重试。"""
+
+
 class FlyAIInvalidJsonError(FlyAIError):
     pass
 

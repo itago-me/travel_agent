@@ -59,6 +59,8 @@ def test_create_agent_uses_official_factory_and_stage31_tools(monkeypatch, tmp_p
         "search_transport_options",
         "search_hotel_options",
         "search_attractions",
+        "create_mock_booking",
+        "cancel_mock_booking",
     }
 
 
