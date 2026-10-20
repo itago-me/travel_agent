@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,37 @@ from .domain import (
     MockBooking,
     utc_now,
 )
+
+
+def _amount_tolerance() -> float:
+    """Relative difference allowed between booked and quoted amounts.
+
+    Default 0.05 (5%). Consultants legitimately renegotiate — a waived service
+    fee or a discount — so the difference is recorded rather than forbidden.
+    Set ``TRAVEL_AGENT_BOOKING_AMOUNT_TOLERANCE=0`` to flag any difference.
+    """
+    raw = os.getenv("TRAVEL_AGENT_BOOKING_AMOUNT_TOLERANCE")
+    if raw is None:
+        return 0.05
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.05
+    return value if value >= 0 else 0.05
+
+
+def _amount_tolerance_is_strict() -> bool:
+    """When true, an over-tolerance mismatch blocks the booking.
+
+    Default is record-only: the audit trail captures the discrepancy and the
+    consultant keeps control. Operators who require exact amounts can make it
+    fatal with ``TRAVEL_AGENT_BOOKING_AMOUNT_STRICT=1``.
+    """
+    return os.getenv("TRAVEL_AGENT_BOOKING_AMOUNT_STRICT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 class SQLiteRepository:
@@ -395,16 +427,32 @@ class SQLiteRepository:
     def add_audit_event(self, event: AuditEvent) -> None:
         with self._connect() as connection:
             self._ensure_exists(connection, event.consultation_id)
-            connection.execute(
-                "INSERT INTO audit_events (id, consultation_id, event_type, details, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    str(uuid4()),
-                    event.consultation_id,
-                    event.event_type,
-                    json.dumps(event.details, ensure_ascii=False),
-                    event.created_at,
-                ),
-            )
+            self._insert_audit_event(connection, event)
+
+    @staticmethod
+    def _insert_audit_event(
+        connection: sqlite3.Connection, event: AuditEvent
+    ) -> None:
+        """Write an audit row on an existing connection.
+
+        Used by write operations that must record the audit row atomically with
+        the business write: if the transaction rolls back, the audit row must not
+        survive either.
+        """
+        from .correlation import correlation_details
+
+        # 事件自带字段优先：显式传入的 turn_id 不被关联上下文覆盖。
+        details = {**correlation_details(), **event.details}
+        connection.execute(
+            "INSERT INTO audit_events (id, consultation_id, event_type, details, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(uuid4()),
+                event.consultation_id,
+                event.event_type,
+                json.dumps(details, ensure_ascii=False),
+                event.created_at,
+            ),
+        )
 
     def set_customer_preference(
         self,
@@ -708,6 +756,58 @@ class SQLiteRepository:
             f"v{row['version_number']}={row['id']}" for row in rows
         ) or "none"
 
+    def _check_amount_against_version(
+        self,
+        connection: sqlite3.Connection,
+        consultation_id: str,
+        itinerary_version_id: str,
+        total_amount: float,
+    ) -> dict[str, Any] | None:
+        """Compare the booking amount with the version's frozen budget total.
+
+        The version carries a total recomputed from real provider prices, so a
+        mismatch means the consultant edited the amount (``--edit-json``) or the
+        model passed a number it never verified. Either way the difference must
+        be recorded: the audit trail has to explain why the booked amount differs
+        from what was quoted.
+
+        Returns the mismatch details when they exceed the tolerance, or ``None``
+        when the amount is consistent (or cannot be compared at all).
+        """
+        row = connection.execute(
+            "SELECT payload FROM itinerary_versions WHERE id = ?",
+            (itinerary_version_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload"])
+        budget = payload.get("budget") or {}
+        frozen_total = budget.get("total")
+        if frozen_total is None:
+            # 版本没有预算（日期或价格缺失时 _estimate_budget 返回 None）。
+            # 没有基准可比，记录事实但不判定为异常。
+            return {
+                "reason": "version_budget_missing",
+                "booked_total": float(total_amount),
+                "version_total": None,
+                "delta": None,
+            }
+        frozen_total = float(frozen_total)
+        delta = float(total_amount) - frozen_total
+        if frozen_total == 0:
+            exceeded = abs(delta) > 0
+        else:
+            exceeded = abs(delta) / abs(frozen_total) > _amount_tolerance()
+        if not exceeded:
+            return None
+        return {
+            "reason": "amount_differs_from_version_budget",
+            "booked_total": float(total_amount),
+            "version_total": frozen_total,
+            "delta": delta,
+            "tolerance_ratio": _amount_tolerance(),
+        }
+
     def create_mock_booking(
         self,
         consultation_id: str,
@@ -756,6 +856,35 @@ class SQLiteRepository:
                         "idempotency_key reused with different booking payload"
                     )
                 return self._mock_booking_from_row(existing)
+            # 金额一致性校验放在幂等检查之后：重放不该重复告警，也不该因为
+            # 顾问事后调整了容差而让一笔已存在的订单变得"不合法"。
+            mismatch = self._check_amount_against_version(
+                connection, consultation_id, itinerary_version_id, total_amount
+            )
+            if mismatch is not None:
+                if _amount_tolerance_is_strict() and mismatch["reason"] == (
+                    "amount_differs_from_version_budget"
+                ):
+                    raise ValueError(
+                        "booking amount differs from the itinerary version budget: "
+                        f"booked {mismatch['booked_total']}, "
+                        f"version {mismatch['version_total']}, "
+                        f"delta {mismatch['delta']}. "
+                        "Either book the quoted amount or unset "
+                        "TRAVEL_AGENT_BOOKING_AMOUNT_STRICT to record the difference."
+                    )
+                self._insert_audit_event(
+                    connection,
+                    AuditEvent(
+                        consultation_id=consultation_id,
+                        event_type="APPROVAL_AMOUNT_MISMATCH",
+                        details={
+                            "itinerary_version_id": itinerary_version_id,
+                            **mismatch,
+                            "idempotency_key": idempotency_key,
+                        },
+                    ),
+                )
             now = utc_now()
             booking_id = str(uuid4())
             connection.execute(
@@ -777,6 +906,22 @@ class SQLiteRepository:
             row = connection.execute(
                 "SELECT * FROM mock_bookings WHERE id = ?", (booking_id,)
             ).fetchone()
+            # 审计与订单在同一个事务内写入：回滚时两者一起消失，不会出现
+            # "有订单没记录"或"有记录没订单"。幂等重放走上面的提前返回，
+            # 因此不会重复记录同一笔创建。
+            self._insert_audit_event(
+                connection,
+                AuditEvent(
+                    consultation_id=consultation_id,
+                    event_type="BOOKING_CREATED",
+                    details={
+                        "booking_id": booking_id,
+                        "itinerary_version_id": itinerary_version_id,
+                        "total_amount": float(total_amount),
+                        "idempotency_key": idempotency_key,
+                    },
+                ),
+            )
         return self._mock_booking_from_row(row)
 
     def cancel_mock_booking(
@@ -819,6 +964,18 @@ class SQLiteRepository:
             row = connection.execute(
                 "SELECT * FROM mock_bookings WHERE id = ?", (booking_id,)
             ).fetchone()
+            self._insert_audit_event(
+                connection,
+                AuditEvent(
+                    consultation_id=consultation_id,
+                    event_type="BOOKING_CANCELLED",
+                    details={
+                        "booking_id": booking_id,
+                        "cancellation_reason": reason,
+                        "idempotency_key": idempotency_key,
+                    },
+                ),
+            )
         return self._mock_booking_from_row(row)
 
     def list_mock_bookings(self, consultation_id: str) -> list[MockBooking]:
@@ -829,6 +986,21 @@ class SQLiteRepository:
                 (consultation_id,),
             ).fetchall()
         return [self._mock_booking_from_row(row) for row in rows]
+
+    def count_tool_executions(self, consultation_id: str) -> int:
+        """Tool calls attempted for this consultation, successful or not.
+
+        Failures count too: otherwise a model that keeps hitting errors could
+        retry forever without ever consuming budget.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) FROM audit_events
+                   WHERE consultation_id = ?
+                     AND event_type IN ('TOOL_EXECUTED', 'TOOL_FAILED')""",
+                (consultation_id,),
+            ).fetchone()
+        return int(row[0])
 
     def list_audit_events(self, consultation_id: str) -> list[AuditEvent]:
         with self._connect() as connection:

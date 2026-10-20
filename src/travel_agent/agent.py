@@ -68,6 +68,37 @@ def create_chat_model(settings: AgentSettings):
     return chat_openai(**model_kwargs)
 
 
+def _positive_env(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back on bad input."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _governance_middleware(
+    database: str | Path, consultation_id: str | None
+) -> list[Any]:
+    """Tool audit + call budget, only when the turn belongs to a consultation.
+
+    ``consultation_id`` is absent for factory smoke tests that only assert tool
+    wiring, so governance stays out of that path rather than inventing an owner.
+    """
+    if not consultation_id:
+        return []
+    from .repository import SQLiteRepository
+    from .tool_governance import ToolGovernanceMiddleware
+
+    return [
+        ToolGovernanceMiddleware(
+            SQLiteRepository(database),
+            consultation_id,
+            max_calls=_positive_env("TRAVEL_AGENT_MAX_TOOL_CALLS", 30),
+        )
+    ]
+
+
 def create_agent_app(
     database: str | Path,
     settings: AgentSettings | None = None,
@@ -76,6 +107,7 @@ def create_agent_app(
     provider_settings: ProviderSettings | None = None,
     flyai_client: FlyAIClient | None = None,
     tools: list[Any] | None = None,
+    consultation_id: str | None = None,
 ):
     """Create the production Agent using LangChain's official factory."""
     settings = settings or load_agent_settings()
@@ -99,13 +131,6 @@ def create_agent_app(
         TravelMemoryMiddleware,
         TravelAgentState,
     )
-
-    def _positive_env(name: str, default: int) -> int:
-        try:
-            value = int(os.getenv(name, str(default)))
-        except ValueError:
-            return default
-        return value if value > 0 else default
 
     provider_settings = provider_settings or ProviderSettings.from_env()
     if tools is None:
@@ -131,6 +156,7 @@ def create_agent_app(
                 max_messages=_positive_env("TRAVEL_AGENT_CONTEXT_MAX_MESSAGES", 12),
                 max_tokens=_positive_env("TRAVEL_AGENT_CONTEXT_MAX_TOKENS", 4000),
             ),
+            *_governance_middleware(database, consultation_id),
             HumanInTheLoopMiddleware(
                 interrupt_on={
                     "create_mock_booking": {

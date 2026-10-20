@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import date
 from typing import Any
 from uuid import uuid4
@@ -14,13 +15,17 @@ from .domain import (
     CustomerPreference,
     Message,
 )
+from .correlation import correlated
+from .logging_utils import configure_logging, log_context, summarize
 from .repository import SQLiteRepository
+from .tool_governance import ToolBudgetExceeded
 from .requirement_extractor import extract_requirements
 from .agent import AgentSettings, create_agent_app, load_agent_settings
 from .langchain_tools import create_sensitive_booking_tools, create_travel_tools
 from .provider_factory import ProviderSettings
 from langchain_core.messages import RemoveMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command
 from pydantic import ValidationError
@@ -154,6 +159,75 @@ _VERSION_TOOLS = (
 )
 
 
+def _recursion_limit() -> int:
+    """Upper bound on LangGraph supersteps for one turn.
+
+    Without it a model that keeps re-querying never stops on its own. Read from
+    the environment so operators can tighten it without a code change.
+    """
+    try:
+        value = int(os.getenv("TRAVEL_AGENT_MAX_AGENT_STEPS", "25"))
+    except ValueError:
+        return 25
+    return value if value > 0 else 25
+
+
+class TurnTimeout(RuntimeError):
+    """A model turn exceeded its wall-clock budget."""
+
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"本轮模型调用超过 {timeout_seconds:g} 秒仍未完成，已中断。"
+            "请缩小问题范围后重试。"
+        )
+
+
+def _turn_timeout_seconds() -> float:
+    """Wall-clock budget for one model turn.
+
+    FlyAI already has timeout/retry/error grading; the model call was the only
+    external dependency with no bound at all. A turn that hangs blocks the CLI
+    (and, once 6.4 lands, an HTTP request) indefinitely, so it needs a ceiling.
+
+    Default 300s: generous for a multi-tool turn on a slow provider, but finite.
+    Set ``TRAVEL_AGENT_TURN_TIMEOUT_SECONDS=0`` to disable entirely.
+    """
+    try:
+        value = float(os.getenv("TRAVEL_AGENT_TURN_TIMEOUT_SECONDS", "300"))
+    except ValueError:
+        return 300.0
+    return value if value >= 0 else 300.0
+
+
+def await_turn(coro, *, consultation_id: str | None = None):
+    """Drive one async turn to completion under a wall-clock budget.
+
+    Cancellation matters more than the error message: an abandoned model call
+    keeps a socket and (with a shared loop in 6.4) a task alive. ``wait_for``
+    cancels the coroutine rather than merely returning early.
+    """
+    timeout = _turn_timeout_seconds()
+
+    async def guarded():
+        if timeout <= 0:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except TimeoutError as error:
+            raise TurnTimeout(timeout) from error
+
+    return asyncio.run(guarded())
+
+
+def _agent_config(thread_id: str) -> dict[str, Any]:
+    """Config shared by every ainvoke/aget_state call on a thread."""
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": _recursion_limit(),
+    }
+
+
 class ConsultationService:
     def __init__(
         self,
@@ -167,6 +241,7 @@ class ConsultationService:
                 f"{repository.database_path.stem}_checkpoints.sqlite"
             )
         )
+        configure_logging()
 
     def create_consultation(
         self,
@@ -327,6 +402,7 @@ class ConsultationService:
             *create_sensitive_booking_tools(self.repository.database_path),
         ]
 
+    @correlated
     def chat_consultation(
         self,
         consultation_id: str,
@@ -343,6 +419,14 @@ class ConsultationService:
         if pending_result is not None:
             return pending_result
         loaded = load_agent_settings(env_file)
+        with log_context(
+            consultation_id=consultation_id, thread_id=consultation.thread_id
+        ) as log:
+            log.info(
+                "轮次开始 model=%s message=%s",
+                model_name or loaded.model_name,
+                summarize(user_message),
+            )
         settings = AgentSettings(
             model_mode=loaded.model_mode,
             model_name=model_name or loaded.model_name,
@@ -356,7 +440,7 @@ class ConsultationService:
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
-                config = {"configurable": {"thread_id": consultation.thread_id}}
+                config = _agent_config(consultation.thread_id)
                 checkpoint = await checkpointer.aget_tuple(config)
                 # Read once per new thread, before constructing the Agent.
                 # Existing checkpoints predating 4.4 get their snapshot on next chat.
@@ -383,6 +467,7 @@ class ConsultationService:
                     settings,
                     checkpointer=checkpointer,
                     tools=tools,
+                    consultation_id=consultation_id,
                 )
                 history_status = "complete"
                 if checkpoint is not None:
@@ -449,8 +534,85 @@ class ConsultationService:
                 next_input.update(self._itinerary_version_state(consultation_id))
                 return await agent.ainvoke(next_input, config=config)
 
-        result = asyncio.run(run_chat())
-        return self._finalize_agent_result(consultation, result)
+        try:
+            result = await_turn(run_chat(), consultation_id=consultation_id)
+        except ToolBudgetExceeded as exceeded:
+            return self._stopped_turn_result(
+                consultation,
+                status="TOOL_BUDGET_EXCEEDED",
+                event_type="TURN_STOPPED_BY_BUDGET",
+                answer=str(exceeded),
+                details={
+                    "max_calls": exceeded.max_calls,
+                    "blocked_tool": exceeded.tool_name,
+                },
+            )
+        except TurnTimeout as timed_out:
+            with log_context(consultation_id=consultation_id) as log:
+                log.error(
+                    "本轮超时中断 timeout=%ss", timed_out.timeout_seconds
+                )
+            return self._stopped_turn_result(
+                consultation,
+                status="TURN_TIMEOUT",
+                event_type="TURN_STOPPED_BY_TIMEOUT",
+                answer=str(timed_out),
+                details={"timeout_seconds": timed_out.timeout_seconds},
+            )
+        except GraphRecursionError as error:
+            return self._stopped_turn_result(
+                consultation,
+                status="STEP_LIMIT_EXCEEDED",
+                event_type="TURN_STOPPED_BY_STEP_LIMIT",
+                answer=(
+                    f"本轮已达到最大推理步数（{_recursion_limit()} 步）而未能得出结论，"
+                    "已停止。请缩小问题范围后重试。"
+                ),
+                details={"recursion_limit": _recursion_limit(), "error": str(error)[:300]},
+            )
+        finalized = self._finalize_agent_result(consultation, result)
+        with log_context(
+            consultation_id=consultation_id, thread_id=consultation.thread_id
+        ) as log:
+            log.info(
+                "轮次完成 status=%s tool_calls=%s",
+                finalized.get("status"),
+                ",".join(finalized.get("tool_calls") or []) or "none",
+            )
+        return finalized
+
+    def _stopped_turn_result(
+        self,
+        consultation: Consultation,
+        *,
+        status: str,
+        event_type: str,
+        answer: str,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Report a governance stop as a normal result instead of an exception.
+
+        Both a spent tool budget and a hit step limit are expected outcomes of
+        running a real model. The consultant needs a usable answer and a reason,
+        not a traceback.
+        """
+        self.repository.add_audit_event(
+            AuditEvent(
+                consultation_id=consultation.id,
+                event_type=event_type,
+                details=details,
+            )
+        )
+        self.repository.update_consultation_status(consultation.id, "OPEN")
+        return {
+            "consultation_id": consultation.id,
+            "thread_id": consultation.thread_id,
+            "status": status,
+            "answer": answer,
+            "tool_calls": [],
+            "approval_requests": [],
+            "messages": [],
+        }
 
     def _record_approval_interrupts(
         self, consultation: Consultation, result: dict[str, Any]
@@ -528,6 +690,7 @@ class ConsultationService:
         self.get_consultation(consultation_id)
         return self.repository.list_pending_approval_requests(consultation_id)
 
+    @correlated
     def decide_approval(
         self,
         approval_id: str,
@@ -581,6 +744,7 @@ class ConsultationService:
             return self._approval_progress_result(approval.consultation_id, decided)
         return self.resume_approved_consultation(approval.consultation_id)
 
+    @correlated
     def reject_approval(
         self,
         approval_id: str,
@@ -666,6 +830,7 @@ class ConsultationService:
             "approval_requests": [approval.as_dict() for approval in pending],
         }
 
+    @correlated
     def resume_approved_consultation(self, consultation_id: str) -> dict[str, Any]:
         """Continue an interrupted thread once every action has a decision."""
         consultation = self.get_consultation(consultation_id)
@@ -769,18 +934,19 @@ class ConsultationService:
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
-                config = {"configurable": {"thread_id": consultation.thread_id}}
+                config = _agent_config(consultation.thread_id)
                 agent = create_agent_app(
                     self.repository.database_path,
                     settings,
                     checkpointer=checkpointer,
                     tools=tools,
+                    consultation_id=consultation.id,
                 )
                 return await agent.ainvoke(
                     Command(resume={"decisions": decisions}), config=config
                 )
 
-        result = asyncio.run(run_resume())
+        result = await_turn(run_resume(), consultation_id=consultation.id)
         return self._finalize_agent_result(
             consultation, result, resumed_interrupt_ids=(interrupt_id,)
         )
