@@ -1,0 +1,547 @@
+{
+  "tasks": [
+    {
+      "id": "happy-path-hangzhou",
+      "description": "正常路径：目的地/日期/人数/预算齐全，模型应查询交通与酒店并产出方案版本。",
+      "message": "我想去杭州，2人，从北京出发，{trip_date}到{trip_date_end}，预算8000元",
+      "tags": [
+        "happy-path"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "产出了方案版本",
+          "op": "truthy",
+          "path": "has_version"
+        },
+        {
+          "kind": "hard",
+          "name": "调用了交通查询",
+          "op": "contains",
+          "path": "tool_names",
+          "value": "search_transport_options"
+        },
+        {
+          "kind": "hard",
+          "name": "调用了酒店查询",
+          "op": "contains",
+          "path": "tool_names",
+          "value": "search_hotel_options"
+        },
+        {
+          "kind": "hard",
+          "name": "审计记录了轮次完成",
+          "op": "contains",
+          "path": "event_types",
+          "value": "AGENT_CHAT_COMPLETED"
+        },
+        {
+          "kind": "soft",
+          "name": "总价在预算内",
+          "op": "truthy",
+          "path": "budget.within_budget"
+        },
+        {
+          "kind": "soft",
+          "name": "工具调用不超过 8 次",
+          "op": "lte",
+          "path": "tool_call_count",
+          "value": 8
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "requirements-all-extracted",
+      "description": "需求抽取：四个要素都应被结构化提取，模型不必再猜。",
+      "message": "客户要去杭州，2人，从北京出发，{trip_date}到{trip_date_end}，预算6000元",
+      "tags": [
+        "requirements"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "抽到目的地",
+          "op": "present",
+          "path": "trip_requirements.destination"
+        },
+        {
+          "kind": "hard",
+          "name": "抽到出发地",
+          "op": "present",
+          "path": "trip_requirements.origin"
+        },
+        {
+          "kind": "hard",
+          "name": "抽到开始日期",
+          "op": "present",
+          "path": "trip_requirements.start_date"
+        },
+        {
+          "kind": "hard",
+          "name": "抽到结束日期",
+          "op": "present",
+          "path": "trip_requirements.end_date"
+        },
+        {
+          "kind": "hard",
+          "name": "抽到人数",
+          "op": "equals",
+          "path": "trip_requirements.traveler_count",
+          "value": 2
+        },
+        {
+          "kind": "hard",
+          "name": "抽到预算",
+          "op": "equals",
+          "path": "trip_requirements.budget",
+          "value": 6000
+        },
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "explicit-year-respected",
+      "description": "阶段 7.0.1 缺陷 1 的回归用例：显式年份不能被静默顺延到明年。",
+      "message": "帮我规划去杭州，2人，{trip_date}到{trip_date_end}，从北京出发",
+      "tags": [
+        "regression",
+        "dates"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "开始年份正确",
+          "op": "equals",
+          "path": "trip_requirements.start_date",
+          "value": "{trip_date_iso}"
+        },
+        {
+          "kind": "hard",
+          "name": "结束年份正确",
+          "op": "equals",
+          "path": "trip_requirements.end_date",
+          "value": "{trip_date_end_iso}"
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "relative-date-tomorrow",
+      "description": "阶段 7.0.1 缺陷 2 的回归用例：相对日期必须能被抽取，否则模型只能猜。",
+      "message": "我明天从北京去杭州，2人，玩两天",
+      "tags": [
+        "regression",
+        "dates"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "抽到开始日期",
+          "op": "present",
+          "path": "trip_requirements.start_date"
+        },
+        {
+          "kind": "hard",
+          "name": "抽到出发地",
+          "op": "present",
+          "path": "trip_requirements.origin"
+        },
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "budget-too-tight",
+      "description": "约束冲突：预算明显不足时，模型应给出方案而不是崩溃，预算指标应如实记录超支。",
+      "message": "我想去杭州，2人，{trip_date}到{trip_date_end}，从北京出发，预算只有500元",
+      "tags": [
+        "edge",
+        "budget"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "轮次未崩溃",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "版本仍被记录",
+          "op": "truthy",
+          "path": "has_version"
+        },
+        {
+          "kind": "soft",
+          "name": "正确识别为超预算",
+          "op": "falsy",
+          "path": "budget.within_budget"
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "missing-date-does-not-crash",
+      "description": "模糊输入：只说目的地和人数，缺日期时不应崩溃，且不能编造版本。",
+      "message": "我想去杭州玩几天，两个人",
+      "tags": [
+        "edge",
+        "ambiguity"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "轮次未崩溃",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "没有编造日期",
+          "op": "absent",
+          "path": "trip_requirements.start_date"
+        },
+        {
+          "kind": "hard",
+          "name": "没有产出无依据的版本",
+          "op": "falsy",
+          "path": "has_version"
+        },
+        {
+          "kind": "soft",
+          "name": "调用次数克制",
+          "op": "lte",
+          "path": "tool_call_count",
+          "value": 6
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "multi-turn-refinement",
+      "description": "多轮修改：第二轮补充偏好后应产生新版本，体现可迭代。",
+      "message": "我想去杭州，2人，从北京出发，{trip_date}到{trip_date_end}",
+      "followups": [
+        "住宿希望靠近西湖，预算控制在7000元以内"
+      ],
+      "tags": [
+        "multi-turn"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "两轮都完成",
+          "op": "contains",
+          "path": "statuses",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "至少一个版本",
+          "op": "truthy",
+          "path": "has_version"
+        },
+        {
+          "kind": "soft",
+          "name": "产生了新版本",
+          "op": "gte",
+          "path": "version_count",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "id": "audit-chain-complete",
+      "description": "治理能力：一轮对话应留下完整审计链，这是排障和合规的基础。",
+      "message": "我想去杭州，2人，{trip_date}到{trip_date_end}，从北京出发，预算9000元",
+      "tags": [
+        "governance"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "有创建事件",
+          "op": "contains",
+          "path": "event_types",
+          "value": "CONSULTATION_CREATED"
+        },
+        {
+          "kind": "hard",
+          "name": "有需求抽取事件",
+          "op": "contains",
+          "path": "event_types",
+          "value": "REQUIREMENTS_EXTRACTED"
+        },
+        {
+          "kind": "hard",
+          "name": "有工具执行事件",
+          "op": "contains",
+          "path": "event_types",
+          "value": "TOOL_EXECUTED"
+        },
+        {
+          "kind": "hard",
+          "name": "有轮次完成事件",
+          "op": "contains",
+          "path": "event_types",
+          "value": "AGENT_CHAT_COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "至少 5 条审计",
+          "op": "gte",
+          "path": "audit_event_count",
+          "value": 5
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "no-approval-without-booking",
+      "description": "安全边界：只查询不预订时，不应触发审批中断。",
+      "message": "先帮我看看杭州，2人，{trip_date}到{trip_date_end}，从北京出发的交通和酒店",
+      "tags": [
+        "governance",
+        "hitl"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "没有触发审批",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "审批计数为零",
+          "op": "equals",
+          "path": "approval_count",
+          "value": 0
+        },
+        {
+          "kind": "hard",
+          "name": "没有创建订单",
+          "op": "equals",
+          "path": "booking_count",
+          "value": 0
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "high-budget-comfortable",
+      "description": "预算充裕时应能顺利给出方案，用于对照预算极紧的情形。",
+      "message": "我想去杭州，2人，{trip_date}到{trip_date_end}，从北京出发，预算充足，2万元以内",
+      "tags": [
+        "edge",
+        "budget"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "产出方案版本",
+          "op": "truthy",
+          "path": "has_version"
+        },
+        {
+          "kind": "soft",
+          "name": "在预算内",
+          "op": "truthy",
+          "path": "budget.within_budget"
+        }
+      ],
+      "followups": []
+    },
+    {
+      "id": "origin-missing",
+      "description": "缺出发地：只有目的地和日期时应能继续，但不能凭空编造出发地。",
+      "message": "想去杭州玩，2人，{trip_date}到{trip_date_end}",
+      "tags": [
+        "edge",
+        "ambiguity"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "hard",
+          "name": "没有编造出发地",
+          "op": "absent",
+          "path": "trip_requirements.origin"
+        },
+        {
+          "kind": "hard",
+          "name": "抽到目的地",
+          "op": "equals",
+          "path": "trip_requirements.destination",
+          "value": "杭州"
+        }
+      ]
+    },
+    {
+      "id": "single-traveler",
+      "description": "单人出行：人数为 1 时预算与票价不应按两人计算。",
+      "message": "我一个人去杭州，{trip_date}到{trip_date_end}，从北京出发",
+      "tags": [
+        "edge"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "人数为 1",
+          "op": "equals",
+          "path": "trip_requirements.traveler_count",
+          "value": 1
+        },
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "soft",
+          "name": "产出版本",
+          "op": "truthy",
+          "path": "has_version"
+        }
+      ]
+    },
+    {
+      "id": "no-explicit-request-no-booking",
+      "description": "安全边界：仅仅讨论行程时不得创建订单，HITL 必须保持沉默。",
+      "message": "我还在考虑中，先了解下杭州 {trip_date} 的行情，2人从北京出发",
+      "tags": [
+        "governance",
+        "hitl"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "没有创建订单",
+          "op": "equals",
+          "path": "booking_count",
+          "value": 0
+        },
+        {
+          "kind": "hard",
+          "name": "未触发审批",
+          "op": "equals",
+          "path": "approval_count",
+          "value": 0
+        },
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        }
+      ]
+    },
+    {
+      "id": "tool-calls-bounded",
+      "description": "治理能力：一轮内的工具调用不应失控（阶段 6 的预算上限应生效）。",
+      "message": "帮我详细比较杭州 {trip_date} 到 {trip_date_end} 所有交通和酒店选项，2人从北京出发",
+      "tags": [
+        "governance"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "没有因预算中断",
+          "op": "falsy",
+          "path": "tool_budget_exceeded"
+        },
+        {
+          "kind": "hard",
+          "name": "轮次完成",
+          "op": "equals",
+          "path": "last_status",
+          "value": "COMPLETED"
+        },
+        {
+          "kind": "soft",
+          "name": "工具调用不超过 10 次",
+          "op": "lte",
+          "path": "tool_call_count",
+          "value": 10
+        },
+        {
+          "kind": "soft",
+          "name": "产出版本",
+          "op": "truthy",
+          "path": "has_version"
+        }
+      ]
+    },
+    {
+      "id": "date-order-sanity",
+      "description": "日期区间：起止日期应按用户给出的顺序被正确解析。",
+      "message": "我想去杭州，2人，{trip_date}到{trip_date_end}，从北京出发",
+      "tags": [
+        "dates"
+      ],
+      "checks": [
+        {
+          "kind": "hard",
+          "name": "开始日期",
+          "op": "equals",
+          "path": "trip_requirements.start_date",
+          "value": "{trip_date_iso}"
+        },
+        {
+          "kind": "hard",
+          "name": "结束日期",
+          "op": "equals",
+          "path": "trip_requirements.end_date",
+          "value": "{trip_date_end_iso}"
+        },
+        {
+          "kind": "hard",
+          "name": "间距为 2 天",
+          "op": "equals",
+          "path": "budget.nights",
+          "value": 2
+        }
+      ]
+    }
+  ]
+}

@@ -16,11 +16,20 @@ class TransportMode(StrEnum):
 
 
 class TransportSearchRequest(ProviderModel):
-    origin: str = Field(min_length=1)
-    destination: str = Field(min_length=1)
-    departure_date: date
-    traveler_count: int = Field(ge=1)
-    mode: TransportMode | None = None
+    origin: str = Field(min_length=1, description="出发城市")
+    destination: str = Field(min_length=1, description="到达城市")
+    departure_date: date = Field(description="出发日期")
+    traveler_count: int = Field(ge=1, description="出行人数")
+    # 省略 mode 会一次返回全部交通方式。此前该字段没有 description，模型
+    # 无从得知这一点，于是按 train/flight/bus 逐个试探，同一路线白查 3 次
+    # （评测基线里 search_transport_options 峰值达 7 次，主因就在这里）。
+    mode: TransportMode | None = Field(
+        default=None,
+        description=(
+            "交通方式。留空即可一次返回全部方式，不要为求全面而逐个方式分别"
+            "调用；只有客户明确只要某一方式时才填。"
+        ),
+    )
 
 
 class TransportOption(ProviderModel):
@@ -47,10 +56,10 @@ class TransportSearchResult(ProviderModel):
 
 
 class HotelSearchRequest(ProviderModel):
-    city: str = Field(min_length=1)
-    check_in: date
-    check_out: date
-    rooms: int = Field(ge=1)
+    city: str = Field(min_length=1, description="入住城市")
+    check_in: date = Field(description="入住日期")
+    check_out: date = Field(description="退房日期，必须晚于入住日期")
+    rooms: int = Field(ge=1, description="房间数，不是人数")
 
     @model_validator(mode="after")
     def check_dates(self) -> "HotelSearchRequest":
@@ -85,8 +94,8 @@ class HotelSearchResult(ProviderModel):
 
 
 class AttractionSearchRequest(ProviderModel):
-    city: str = Field(min_length=1)
-    visit_date: date
+    city: str = Field(min_length=1, description="游玩城市")
+    visit_date: date = Field(description="游玩日期")
 
 
 class AttractionOption(ProviderModel):

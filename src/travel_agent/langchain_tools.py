@@ -52,19 +52,30 @@ def create_travel_tools(
         StructuredTool.from_function(
             coroutine=search_transport,
             name="search_transport_options",
-            description="查询指定路线、日期和人数的交通选项。",
+            description=(
+                "查询指定路线、日期和人数的交通选项。"
+                "不填 mode 会一次返回全部交通方式（火车/飞机/汽车），"
+                "因此同一路线同一天只需调用一次——不要为了比较不同方式而"
+                "分别调用。往返行程需要两次调用（去程和返程各一次）。"
+            ),
             args_schema=TransportSearchRequest,
         ),
         StructuredTool.from_function(
             coroutine=search_hotel,
             name="search_hotel_options",
-            description="查询指定城市和入住日期的酒店选项。",
+            description=(
+                "查询指定城市和入住日期的酒店选项。rooms 是房间数不是人数。"
+                "同一城市同一入住区间只需调用一次。"
+            ),
             args_schema=HotelSearchRequest,
         ),
         StructuredTool.from_function(
             coroutine=search_attractions,
             name="search_attractions",
-            description="查询指定城市和游览日期的景点选项。",
+            description=(
+                "查询指定城市和游览日期的景点选项。"
+                "同一城市一次查询即可覆盖多个日期，不要按天分别调用。"
+            ),
             args_schema=AttractionSearchRequest,
         ),
     ]

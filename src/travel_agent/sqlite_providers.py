@@ -28,9 +28,15 @@ def _connect(database: str | Path) -> sqlite3.Connection:
     return connection
 
 
-def initialize_travel_data(database: str | Path) -> None:
-    """Create and seed the small local catalog used by the Agent demo."""
+def initialize_travel_data(database: str | Path, transport_date: str | None = None) -> None:
+    """Create and seed the small local catalog used by the Agent demo.
+
+    ``transport_date`` exists for the evaluation suite: the bundled sample data
+    pins transport to one fixed date, which goes stale as soon as that date
+    passes, so evals seed their own date. Production callers keep the default.
+    """
     database = Path(database)
+    transport_day = transport_date or "2026-10-01"
     database.parent.mkdir(parents=True, exist_ok=True)
     with _connect(database) as connection:
         connection.executescript(
@@ -74,8 +80,8 @@ def initialize_travel_data(database: str | Path) -> None:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                ("train-bj-hz-001", "train", "北京", "杭州", "2026-10-01", "08:00", "13:30", 330, 1800.0, "sqlite_transport"),
-                ("train-bj-hz-002", "train", "北京", "杭州", "2026-10-01", "14:00", "19:45", 345, 1500.0, "sqlite_transport"),
+                ("train-bj-hz-001", "train", "北京", "杭州", transport_day, "08:00", "13:30", 330, 1800.0, "sqlite_transport"),
+                ("train-bj-hz-002", "train", "北京", "杭州", transport_day, "14:00", "19:45", 345, 1500.0, "sqlite_transport"),
             ],
         )
         connection.executemany(
