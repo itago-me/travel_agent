@@ -207,57 +207,6 @@ def _date_tokens(trip_date) -> dict[str, str]:
     }
 
 
-def _reset_async_http_clients() -> None:
-    """Drop cached httpx clients between tasks.
-
-    Each task runs in its own ``asyncio.run``, which closes that loop. The
-    OpenAI client caches its httpx transport with ``lru_cache`` keyed only by
-    base_url/options, so the next task reuses a connection pool bound to the
-    loop that just closed and fails with "Event loop is closed".
-
-    Clearing the cache per task keeps the evaluation runnable until the
-    persistent-service work (schedule 6.4) removes the per-request loop
-    entirely. It is a workaround scoped to the runner, not a fix to the model
-    layer.
-    """
-    try:
-        from langchain_openai.chat_models import _client_utils
-    except ImportError:  # pragma: no cover - 取决于依赖版本
-        return
-    # 只清缓存不够：被丢弃的 AsyncClient 会在 GC 时于已关闭的 loop 上调用
-    # aclose()，刷出一片 "Event loop is closed"。必须先记下实例，再在
-    # 当前（仍存活的）loop 里主动关掉它们。
-    stale: list[Any] = []
-    for name in ("_cached_async_httpx_client", "_cached_sync_httpx_client"):
-        cached = getattr(_client_utils, name, None)
-        if cached is None:
-            continue
-        if hasattr(cached, "cache_info") and hasattr(cached, "cache_clear"):
-            cache = getattr(cached, "cache", None)
-            if isinstance(cache, dict):
-                stale.extend(cache.values())
-            cached.cache_clear()
-    if not stale:
-        return
-    import asyncio
-
-    async def _close_all() -> None:
-        for client in stale:
-            aclose = getattr(client, "aclose", None)
-            if aclose is None:
-                continue
-            try:
-                await aclose()
-            except Exception:  # noqa: BLE001 - 关闭失败不应影响评测
-                pass
-
-    try:
-        asyncio.run(_close_all())
-    except RuntimeError:
-        # 已经在 loop 里（例如被评测代码直接调用）：交给 GC，不影响结果。
-        pass
-
-
 def _render(template: str, tokens: dict[str, str]) -> str:
     rendered = template
     for key, value in tokens.items():
@@ -291,7 +240,6 @@ def run_task(
 ) -> TaskResult:
     """Run one task in an isolated database and evaluate its checks."""
     started = time.monotonic()
-    _reset_async_http_clients()
     workdir = Path(tempfile.mkdtemp(prefix=f"eval-{task.id}-"))
     service = create_consultation_service(
         workdir / "eval.db", checkpoint_path=workdir / "eval_ck.sqlite"
@@ -318,8 +266,7 @@ def run_task(
         for followup in task.followups:
             # 每一轮都是一次 asyncio.run，loop 会关闭，因此每轮之间同样要
             # 清掉绑定在旧 loop 上的 httpx 连接池。
-            _reset_async_http_clients()
-            turn_results.append(
+                    turn_results.append(
                 service.chat_consultation(
                     consultation.id, followup, env_file=env_file, model_name=model_name
                 )

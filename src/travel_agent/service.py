@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from datetime import date
-from typing import Any
+from typing import Any, AsyncIterator, Iterator
 from uuid import uuid4
 from pathlib import Path
 
@@ -16,6 +16,7 @@ from .domain import (
     Message,
 )
 from .correlation import correlated
+from .persistent import PersistentLoopRunner
 from .logging_utils import configure_logging, log_context, summarize
 from .repository import SQLiteRepository
 from .tool_governance import ToolBudgetExceeded
@@ -47,6 +48,76 @@ def _last_message_content(messages: list[Any]) -> str:
         if isinstance(message, dict) and message.get("content"):
             return str(message["content"])
     return ""
+
+
+def _single_event(result: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Wrap an already-computed turn result as a one-shot event stream."""
+    yield {"type": "done", "result": result}
+
+
+def _stream_events(chunk: Any) -> list[dict[str, Any]]:
+    """Translate one LangChain message chunk into stream events.
+
+    Only text deltas and tool-call announcements are surfaced. Reasoning
+    metadata, usage chunks and empty content are dropped: they would reach the
+    client as noise it cannot act on, and usage is already reported once in the
+    final ``done`` payload.
+    """
+    events: list[dict[str, Any]] = []
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str) and content:
+        events.append({"type": "token", "content": content})
+    elif isinstance(content, list):
+        # 部分模型把内容切成 [{"type":"text","text":...}] 结构
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if text:
+                    events.append({"type": "token", "content": text})
+    for call in getattr(chunk, "tool_call_chunks", []) or []:
+        name = call.get("name") if isinstance(call, dict) else None
+        if name:
+            events.append({"type": "tool", "name": name})
+    return events
+
+
+def _token_usage(messages: list[Any]) -> dict[str, int]:
+    """Sum token usage across the model messages of one turn.
+
+    LangChain exposes ``usage_metadata`` on ``AIMessage`` for providers that
+    report it. Some OpenAI-compatible gateways only populate
+    ``response_metadata["token_usage"]`` (or ``usage``), so both shapes are
+    read; when neither is present the counts stay zero and the caller can tell
+    "provider did not report" apart from "no tokens used".
+
+    Counting per message (not per turn) matters because a single turn can make
+    several model calls - one per tool round - and the cost is the sum.
+    """
+    input_tokens = output_tokens = 0
+    reported = False
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            metadata = getattr(message, "response_metadata", None) or {}
+            usage = (
+                metadata.get("token_usage")
+                or metadata.get("usage")
+                if isinstance(metadata, dict)
+                else None
+            )
+        if not isinstance(usage, dict):
+            continue
+        reported = True
+        input_tokens += int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        output_tokens += int(
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "reported": reported,
+    }
 
 
 def _message_as_dict(message: Any) -> dict[str, Any]:
@@ -200,12 +271,47 @@ def _turn_timeout_seconds() -> float:
     return value if value >= 0 else 300.0
 
 
+_RUNNER: PersistentLoopRunner | None = None
+
+
+class _ThreadLocks:
+    """One asyncio.Lock per thread_id, created inside the resident loop.
+
+    常驻服务下多个请求共享 Agent 与 checkpointer。同一 thread_id 的并发
+    chat 会竞争 checkpoint 写入（LangGraph 假设线程内串行），因此整轮
+    chat/resume 必须按 thread 串行化；不同 thread 之间不互斥，仍然并发。
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def for_thread(self, thread_id: str) -> asyncio.Lock:
+        lock = self._locks.get(thread_id)
+        if lock is None:
+            lock = self._locks[thread_id] = asyncio.Lock()
+        return lock
+
+
+_THREAD_LOCKS = _ThreadLocks()
+
+
+def _persistent_runner() -> PersistentLoopRunner:
+    """The process-wide loop runner, created on first use."""
+    global _RUNNER
+    if _RUNNER is None:
+        _RUNNER = PersistentLoopRunner()
+    return _RUNNER
+
+
 def await_turn(coro, *, consultation_id: str | None = None):
-    """Drive one async turn to completion under a wall-clock budget.
+    """Drive one async turn on the persistent loop under a wall-clock budget.
 
     Cancellation matters more than the error message: an abandoned model call
     keeps a socket and (with a shared loop in 6.4) a task alive. ``wait_for``
     cancels the coroutine rather than merely returning early.
+
+    阶段 6.4：协程提交到常驻 loop 而不是每次 ``asyncio.run``。连接、信号量、
+    缓存的客户端都创建和使用于同一个 loop，跨 loop 失效从根上消失。
     """
     timeout = _turn_timeout_seconds()
 
@@ -217,7 +323,10 @@ def await_turn(coro, *, consultation_id: str | None = None):
         except TimeoutError as error:
             raise TurnTimeout(timeout) from error
 
-    return asyncio.run(guarded())
+    # 软预算由 guarded() 内部的 wait_for 执行并转换为 TurnTimeout；
+    # runner 收到的是防卡死安全网：预算 + 30s 余量。正常情况下
+    # wait_for 先触发，TurnTimeout 从协程里抛出来。
+    return _persistent_runner().run_coro_with_timeout(guarded(), timeout + 30)
 
 
 def _agent_config(thread_id: str) -> dict[str, Any]:
@@ -347,7 +456,7 @@ class ConsultationService:
 
             # Inspect persisted interrupts without constructing or calling a model.
             # Always reconcile the whole batch, even if some approvals already exist.
-            interrupts = asyncio.run(read_interrupts())
+            interrupts = _persistent_runner().run_coro(read_interrupts())
             if interrupts:
                 approvals = self._record_approval_interrupts(
                     consultation, {"__interrupt__": interrupts}
@@ -436,7 +545,16 @@ class ConsultationService:
         provider_settings = ProviderSettings.from_env()
         tools = self._build_agent_tools(provider_settings)
 
+        thread_lock = _THREAD_LOCKS.for_thread(consultation.thread_id)
+
         async def run_chat():
+            # 同一 thread 的并发轮次必须串行：LangGraph checkpoint 假设
+            # 线程内没有并发写入。锁在常驻 loop 内创建，按 thread 隔离，
+            # 不同 thread 之间不互斥。
+            async with thread_lock:
+                return await _run_chat_inner()
+
+        async def _run_chat_inner():
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
@@ -680,6 +798,15 @@ class ConsultationService:
     # ------------------------------------------------------------------
     # Human-in-the-loop decisions
     # ------------------------------------------------------------------
+
+    def consultation_usage(self, consultation_id: str) -> dict[str, Any]:
+        """Token usage for a consultation, aggregated from the audit trail.
+
+        Loads the consultation first so an unknown id fails loudly instead of
+        looking like a conversation that has not spent anything.
+        """
+        self.get_consultation(consultation_id)
+        return self.repository.consult_usage_totals(consultation_id)
 
     def list_pending_approvals(self, consultation_id: str) -> list[ApprovalRequest]:
         """Return the pending approvals a consultant still has to decide.
@@ -930,7 +1057,15 @@ class ConsultationService:
         settings = load_agent_settings()
         tools = self._build_agent_tools(ProviderSettings.from_env())
 
+        resume_lock = _THREAD_LOCKS.for_thread(consultation.thread_id)
+
         async def run_resume():
+            # 恢复同样要持 thread 锁：恢复期间不允许同线程新请求插入
+            # （schedule 6.4 第 4 节的并发正确性要求）。
+            async with resume_lock:
+                return await _run_resume_inner()
+
+        async def _run_resume_inner():
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
@@ -950,6 +1085,146 @@ class ConsultationService:
         return self._finalize_agent_result(
             consultation, result, resumed_interrupt_ids=(interrupt_id,)
         )
+
+    def chat_consultation_stream(
+        self,
+        consultation_id: str,
+        user_message: str,
+        *,
+        model_name: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        env_file: str | Path | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Run one agent turn, yielding events as the model produces them.
+
+        Events are plain dicts so CLI and HTTP can format them differently:
+
+        ``{"type": "token", "content": str}``   model text delta
+        ``{"type": "tool", "name": str}``       a tool call started
+        ``{"type": "done", "result": dict}``    the same payload ``chat_consultation`` returns
+        ``{"type": "error", "message": str}``   the turn failed; nothing was persisted
+
+        Streaming is deliberately limited to turns that can be computed from the
+        current checkpoint in one pass. A thread with unresolved interrupts, or
+        one whose saved history needs reconciliation after a crash, falls back
+        to ``chat_consultation`` and emits its result as a single ``done``:
+        replaying those repair paths in a second implementation would mean two
+        places that must agree, which is exactly what caused earlier drift
+        between the CLI and the service layer.
+        """
+        consultation = self.get_consultation(consultation_id)
+        pending_result = self.get_pending_approval_result(consultation_id)
+        if pending_result is not None:
+            return _single_event(pending_result)
+
+        loaded = load_agent_settings(env_file)
+        settings = AgentSettings(
+            model_mode=loaded.model_mode,
+            model_name=model_name or loaded.model_name,
+            api_key=api_key or loaded.api_key,
+            base_url=base_url or loaded.base_url,
+        )
+        provider_settings = ProviderSettings.from_env()
+        tools = self._build_agent_tools(provider_settings)
+        thread_lock = _THREAD_LOCKS.for_thread(consultation.thread_id)
+
+        async def _turn() -> AsyncIterator[dict[str, Any]]:
+            async with thread_lock:
+                async with AsyncSqliteSaver.from_conn_string(
+                    str(self.checkpoint_path)
+                ) as checkpointer:
+                    config = _agent_config(consultation.thread_id)
+                    checkpoint = await checkpointer.aget_tuple(config)
+                    agent = create_agent_app(
+                        self.repository.database_path,
+                        settings,
+                        checkpointer=checkpointer,
+                        tools=tools,
+                        consultation_id=consultation.id,
+                    )
+                    if checkpoint is not None:
+                        state = await agent.aget_state(config)
+                        if getattr(state, "interrupts", ()):
+                            # 未决审批：不能绕过，让调用方先决定
+                            yield {
+                                "type": "pause",
+                                "message": "该会话有待审批的敏感操作，请先决定后再继续",
+                            }
+                            yield {
+                                "type": "done",
+                                "result": self.chat_consultation(
+                                    consultation_id, user_message, model_name=model_name
+                                ),
+                            }
+                            return
+                        history_status = _tool_history_status(
+                            list(state.values.get("messages", []))
+                        )
+                        if history_status != "complete":
+                            # 崩溃后的修复路径交给经过验证的非流式实现
+                            yield {
+                                "type": "resync",
+                                "message": "会话历史需要重建，本轮以非流式方式完成",
+                            }
+                            yield {
+                                "type": "done",
+                                "result": self.chat_consultation(
+                                    consultation_id,
+                                    user_message,
+                                    model_name=model_name,
+                                    api_key=api_key,
+                                    base_url=base_url,
+                                    env_file=env_file,
+                                ),
+                            }
+                            return
+
+                    self.append_message(consultation.id, "user", user_message)
+                    current_requirements = self._absorb_requirements(
+                        consultation_id, user_message
+                    )
+                    trip_requirements = dict(
+                        self.get_consultation(consultation_id).trip_requirements
+                    )
+                    turn_state = {
+                        "current_trip_requirements": current_requirements,
+                        **self._itinerary_version_state(consultation_id),
+                    }
+                    if trip_requirements:
+                        turn_state["trip_requirements"] = trip_requirements
+                    next_input = {
+                        "messages": [{"role": "user", "content": user_message}]
+                    }
+                    next_input.update(turn_state)
+                    if checkpoint is None:
+                        next_input = {
+                            "messages": [
+                                {"role": message.role, "content": message.content}
+                                for message in self.get_consultation(
+                                    consultation_id
+                                ).messages
+                            ],
+                            **turn_state,
+                        }
+
+                    async for chunk, _metadata in agent.astream(
+                        next_input, config=config, stream_mode="messages"
+                    ):
+                        for event in _stream_events(chunk):
+                            yield event
+
+                    final_state = await agent.aget_state(config)
+                    result = dict(final_state.values)
+                    interrupts = getattr(final_state, "interrupts", ())
+                    if interrupts:
+                        result["__interrupt__"] = interrupts
+                    yield {
+                        "type": "done",
+                        "result": self._finalize_agent_result(consultation, result),
+                    }
+
+        return _persistent_runner().iter_async(_turn())
 
     def _finalize_agent_result(
         self,
@@ -995,6 +1270,7 @@ class ConsultationService:
         # Capture what the search tools returned so the consultant can select a
         # version and the sensitive booking tools have something to bind to.
         version = self._record_itinerary_version(consultation, messages)
+        usage = _token_usage(messages)
         self.repository.update_consultation_status(consultation.id, "OPEN")
         self.repository.add_audit_event(
             AuditEvent(
@@ -1004,6 +1280,9 @@ class ConsultationService:
                     "thread_id": consultation.thread_id,
                     "tool_calls": tool_calls,
                     "itinerary_version_id": version["version_id"] if version else None,
+                    # 成本记进审计：事后要能回答"这一轮花了多少 token"，
+                    # 而不是只能看账单。
+                    "usage": usage,
                 },
             )
         )
@@ -1013,6 +1292,7 @@ class ConsultationService:
             "status": "COMPLETED",
             "answer": answer,
             "tool_calls": tool_calls,
+            "usage": usage,
             "messages": [_message_as_dict(message) for message in messages],
         }
         if version is not None:

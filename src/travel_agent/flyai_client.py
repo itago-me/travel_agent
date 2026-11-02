@@ -67,26 +67,26 @@ class FlyAIClient:
             if concurrency_limit is not None
             else os.getenv("TRAVEL_AGENT_FLYAI_CONCURRENCY", "2")
         )
-        # 不要在这里建 asyncio.Semaphore：service 层每个请求调一次
-        # asyncio.run()，而 Semaphore 会绑定到创建它的 event loop，
-        # 第二次调用就会报 "bound to a different event loop"。
-        # 改为按运行中的 loop 惰性创建并缓存。
-        self._semaphores: dict[Any, asyncio.Semaphore] = {}
+        # 信号量绑定创建它的 event loop（asyncio 原语不可跨 loop 复用）。
+        # 常驻服务下整个进程只有一个 loop，因此实际只建一次；
+        # 若 loop 变了（测试进程里每个 asyncio.run 都是新 loop）则重建，
+        # 避免复用死 loop 上的原语导致 "bound to a different event loop"
+        # 甚至死锁。
+        self._semaphore: asyncio.Semaphore | None = None
+        self._semaphore_loop_id: int | None = None
 
     def _semaphore_for_current_loop(self) -> asyncio.Semaphore | None:
+        """The global concurrency gate, valid for the loop it was built in."""
         if self.concurrency_limit <= 0:
             return None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return None
-        semaphore = self._semaphores.get(loop)
-        if semaphore is None:
-            semaphore = asyncio.Semaphore(self.concurrency_limit)
-            self._semaphores[loop] = semaphore
-            # loop 关闭后残留的条目没有意义，及时清理避免字典无限增长。
-            weakref.finalize(loop, self._semaphores.pop, loop, None)
-        return semaphore
+        if self._semaphore is None or self._semaphore_loop_id != id(loop):
+            self._semaphore = asyncio.Semaphore(self.concurrency_limit)
+            self._semaphore_loop_id = id(loop)
+        return self._semaphore
 
     def build_hotel_command(self, request: HotelSearchRequest, *, key_words: str | None = None, poi_name: str | None = None, hotel_types: str | None = None, sort: str | None = None, hotel_stars: str | None = None, hotel_bed_types: str | None = None, max_price: float | None = None) -> list[str]:
         command = [self.command, "search-hotel", "--dest-name", request.city]

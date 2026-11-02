@@ -181,14 +181,6 @@ def _run_eval(args: argparse.Namespace) -> int:
         from .evals.runner import EvalReport
 
         print("\ninterrupted - reporting completed tasks only")
-        # 被打断的那一轮还挂着 httpx 连接；在进程退出前关掉，
-        # 否则 GC 会在已关闭的 loop 上 aclose() 并刷一片报错。
-        try:
-            from .evals.runner import _reset_async_http_clients
-
-            _reset_async_http_clients()
-        except Exception:  # noqa: BLE001 - 清理失败不该盖住中断本身
-            pass
         report = latest.get("report") or EvalReport()
         if not report.results:
             print("no task finished before the interrupt; nothing to report")

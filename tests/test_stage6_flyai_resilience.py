@@ -315,11 +315,12 @@ def test_client_survives_multiple_event_loops():
         results = asyncio.run(contended())
         assert len(results) == 4, f"round {round_no} did not complete"
 
-    # 每个 loop 一个信号量，关闭后条目被清理，不会无限增长
-    assert len(client._semaphores) <= 3
+    # 6.4 后信号量建一次复用，不再是按 loop 缓存的字典
+    assert client._semaphore is not None
 
 
-def test_semaphore_cache_is_keyed_per_loop():
+def test_semaphore_is_created_once_and_reused():
+    """6.4 常驻 loop 下信号量建一次即可；同 loop 内重复获取是同一实例。"""
     client = FlyAIClient(concurrency_limit=2)
 
     async def grab():
@@ -329,7 +330,7 @@ def test_semaphore_cache_is_keyed_per_loop():
     second = asyncio.run(grab())
 
     assert first is not None and second is not None
-    assert first is not second, "不同 loop 必须拿到各自的信号量"
+    assert first is second, "常驻 loop 内必须复用同一个信号量"
 
 
 def test_eager_semaphore_deadlocks_across_loops():
@@ -362,10 +363,10 @@ def test_concurrency_limit_zero_disables_gate():
 
 
 def test_client_does_not_bind_semaphore_at_construction():
-    """构造时不应存在任何已绑定的信号量。"""
+    """构造时不应存在已绑定的信号量——惰性创建，首次在 loop 内使用时才建。"""
     client = FlyAIClient(concurrency_limit=2)
 
-    assert client._semaphores == {}
+    assert client._semaphore is None
 
 
 def test_shared_client_semaphore_is_shared_across_providers():

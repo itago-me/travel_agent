@@ -1002,6 +1002,38 @@ class SQLiteRepository:
             ).fetchone()
         return int(row[0])
 
+    def consult_usage_totals(self, consultation_id: str) -> dict[str, Any]:
+        """Aggregate token usage recorded by finished turns of one consultation.
+
+        Usage is derived from the audit trail rather than a separate counter
+        table: the audit row is written in the same transaction as the turn, so
+        the two can never disagree, and no extra migration is needed.
+
+        ``turns`` counts only turns that actually reported usage, so a caller
+        can tell "no data" (``turns == 0``) from "cheap conversation".
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT details FROM audit_events
+                   WHERE consultation_id = ? AND event_type = 'AGENT_CHAT_COMPLETED'""",
+                (consultation_id,),
+            ).fetchall()
+        input_tokens = output_tokens = turns = 0
+        for row in rows:
+            usage = (json.loads(row["details"]) or {}).get("usage") or {}
+            if not usage.get("reported"):
+                continue
+            turns += 1
+            input_tokens += int(usage.get("input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
+        return {
+            "consultation_id": consultation_id,
+            "turns": turns,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+
     def list_audit_events(self, consultation_id: str) -> list[AuditEvent]:
         with self._connect() as connection:
             rows = connection.execute(
