@@ -64,6 +64,10 @@ def _stream_events(chunk: Any) -> list[dict[str, Any]]:
     final ``done`` payload.
     """
     events: list[dict[str, Any]] = []
+    # 只转述模型自己说的话。ToolMessage 的 content 是工具返回的原始 JSON，
+    # 当成 token 推给客户端会把一大坨结构化数据糊在用户脸上（实测踩到）。
+    if getattr(chunk, "type", None) in ("tool", "human", "system"):
+        return events
     content = getattr(chunk, "content", None)
     if isinstance(content, str) and content:
         events.append({"type": "token", "content": content})

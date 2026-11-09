@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from .application import create_consultation_service
 
@@ -76,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--model-name")
     chat.add_argument("--api-key")
     chat.add_argument("--base-url")
+    chat.add_argument(
+        "--stream",
+        action="store_true",
+        help="print model output as it arrives instead of waiting for the turn to finish",
+    )
 
     itineraries = subparsers.add_parser("itineraries")
     itineraries.add_argument("consultation_id")
@@ -226,6 +232,60 @@ def _run_eval(args: argparse.Namespace) -> int:
                 print(f"  always_fail: {task_id}")
         print(f"report={path}")
     return 0 if report.failed == 0 else 1
+
+
+def _chat_streaming(service: Any, args: Any) -> int:
+    """Print a turn as the model produces it, then a status line.
+
+    Stream mode is for a human watching the console: tokens go straight to
+    stdout and are flushed so they appear immediately. The final JSON is not
+    printed because the answer already scrolled past - scripts that need the
+    exact payload should omit ``--stream``.
+    """
+    tool_calls: list[str] = []
+    result: dict[str, Any] | None = None
+    try:
+        for event in service.chat_consultation_stream(
+            args.consultation_id,
+            args.message,
+            model_name=args.model_name,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            env_file=args.env_file,
+        ):
+            kind = event.get("type")
+            if kind == "token":
+                print(event["content"], end="", flush=True)
+            elif kind == "tool":
+                tool_calls.append(event["name"])
+                print(f"\n[工具] {event['name']}", flush=True)
+            elif kind == "pause":
+                print(f"\n[暂停] {event['message']}", flush=True)
+            elif kind == "resync":
+                print(f"\n[提示] {event['message']}", flush=True)
+            elif kind == "error":
+                print(f"\n[错误] {event['message']}", flush=True)
+                return 1
+            elif kind == "done":
+                result = event.get("result")
+    except KeyboardInterrupt:
+        print("\n[中断] 已停止输出，本轮可能未完整落库", flush=True)
+        return 130
+
+    if result is None:
+        print("\n[错误] 未收到完成事件", flush=True)
+        return 1
+    usage = result.get("usage") or {}
+    tokens = usage.get("total_tokens")
+    summary = {
+        "status": result.get("status"),
+        "consultation_id": result.get("consultation_id"),
+        "tool_calls": result.get("tool_calls") or tool_calls,
+        "usage": usage,
+    }
+    print()
+    print(json.dumps(summary, ensure_ascii=False))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -397,6 +457,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "chat":
+        if args.stream:
+            return _chat_streaming(service, args)
         result = service.chat_consultation(
             args.consultation_id,
             args.message,
