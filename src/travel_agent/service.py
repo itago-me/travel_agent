@@ -1,8 +1,9 @@
 import asyncio
 import json
 import os
+import time
 from datetime import date
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 from uuid import uuid4
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from .domain import (
 from .correlation import correlated
 from .persistent import PersistentLoopRunner
 from .logging_utils import configure_logging, log_context, summarize
+from .tracing import TurnTraceCallback
 from .repository import SQLiteRepository
 from .tool_governance import ToolBudgetExceeded
 from .requirement_extractor import extract_requirements
@@ -38,6 +40,11 @@ from .booking import CancelMockBookingRequest, CreateMockBookingRequest
 # duplicated from the middleware configuration on purpose: the service must not
 # resume a pause it does not understand.
 HITL_TOOL_NAMES = ("create_mock_booking", "cancel_mock_booking")
+
+
+def _elapsed_ms(started: float) -> int:
+    """Wall-clock milliseconds since ``started`` (from ``time.monotonic``)."""
+    return int((time.monotonic() - started) * 1000)
 
 
 def _last_message_content(messages: list[Any]) -> str:
@@ -333,12 +340,28 @@ def await_turn(coro, *, consultation_id: str | None = None):
     return _persistent_runner().run_coro_with_timeout(guarded(), timeout + 30)
 
 
-def _agent_config(thread_id: str) -> dict[str, Any]:
-    """Config shared by every ainvoke/aget_state call on a thread."""
-    return {
+def _agent_config(
+    thread_id: str,
+    consultation_id: str | None = None,
+    *,
+    span_recorder: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    """Config shared by every ainvoke/aget_state call on a thread.
+
+    ``consultation_id`` attaches the turn tracer so model calls and tool
+    executions land in the log under the same consultation, and - when
+    ``span_recorder`` is supplied - in ``turn_spans`` as well. Both are optional
+    because ``aget_state`` shares this config and makes no model calls.
+    """
+    config: dict[str, Any] = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": _recursion_limit(),
     }
+    if consultation_id:
+        config["callbacks"] = [
+            TurnTraceCallback(consultation_id, recorder=span_recorder)
+        ]
+    return config
 
 
 class ConsultationService:
@@ -562,7 +585,11 @@ class ConsultationService:
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
-                config = _agent_config(consultation.thread_id)
+                config = _agent_config(
+                    consultation.thread_id,
+                    consultation.id,
+                    span_recorder=self._span_recorder(consultation.id),
+                )
                 checkpoint = await checkpointer.aget_tuple(config)
                 # Read once per new thread, before constructing the Agent.
                 # Existing checkpoints predating 4.4 get their snapshot on next chat.
@@ -656,11 +683,19 @@ class ConsultationService:
                 next_input.update(self._itinerary_version_state(consultation_id))
                 return await agent.ainvoke(next_input, config=config)
 
+        turn_started = time.monotonic()
         try:
             result = await_turn(run_chat(), consultation_id=consultation_id)
         except ToolBudgetExceeded as exceeded:
+            with log_context(consultation_id=consultation_id) as log:
+                log.warning(
+                    "本轮工具预算耗尽 max_calls=%s blocked_tool=%s",
+                    exceeded.max_calls,
+                    exceeded.tool_name,
+                )
             return self._stopped_turn_result(
                 consultation,
+                duration_ms=_elapsed_ms(turn_started),
                 status="TOOL_BUDGET_EXCEEDED",
                 event_type="TURN_STOPPED_BY_BUDGET",
                 answer=str(exceeded),
@@ -676,14 +711,22 @@ class ConsultationService:
                 )
             return self._stopped_turn_result(
                 consultation,
+                duration_ms=_elapsed_ms(turn_started),
                 status="TURN_TIMEOUT",
                 event_type="TURN_STOPPED_BY_TIMEOUT",
                 answer=str(timed_out),
                 details={"timeout_seconds": timed_out.timeout_seconds},
             )
         except GraphRecursionError as error:
+            with log_context(consultation_id=consultation_id) as log:
+                log.warning(
+                    "本轮达步数上限 recursion_limit=%s error=%s",
+                    _recursion_limit(),
+                    type(error).__name__,
+                )
             return self._stopped_turn_result(
                 consultation,
+                duration_ms=_elapsed_ms(turn_started),
                 status="STEP_LIMIT_EXCEEDED",
                 event_type="TURN_STOPPED_BY_STEP_LIMIT",
                 answer=(
@@ -692,7 +735,9 @@ class ConsultationService:
                 ),
                 details={"recursion_limit": _recursion_limit(), "error": str(error)[:300]},
             )
-        finalized = self._finalize_agent_result(consultation, result)
+        finalized = self._finalize_agent_result(
+            consultation, result, duration_ms=_elapsed_ms(turn_started)
+        )
         with log_context(
             consultation_id=consultation_id, thread_id=consultation.thread_id
         ) as log:
@@ -711,6 +756,7 @@ class ConsultationService:
         event_type: str,
         answer: str,
         details: dict[str, Any],
+        duration_ms: int | None = None,
     ) -> dict[str, Any]:
         """Report a governance stop as a normal result instead of an exception.
 
@@ -722,7 +768,11 @@ class ConsultationService:
             AuditEvent(
                 consultation_id=consultation.id,
                 event_type=event_type,
-                details=details,
+                details={
+                    **details,
+                    # 耗时记进审计：指标端点要算延迟分位数，不能只靠日志
+                    **({"duration_ms": duration_ms} if duration_ms is not None else {}),
+                },
             )
         )
         self.repository.update_consultation_status(consultation.id, "OPEN")
@@ -803,6 +853,55 @@ class ConsultationService:
     # Human-in-the-loop decisions
     # ------------------------------------------------------------------
 
+    def _span_recorder(self, consultation_id: str) -> Callable[..., None]:
+        """Bind the repository span writer to one consultation."""
+
+        def record(
+            *,
+            turn_id: str,
+            kind: str,
+            name: str,
+            duration_ms: int,
+            details: dict[str, Any],
+            sequence: int | None = None,
+        ) -> None:
+            self.repository.add_turn_span(
+                consultation_id=consultation_id,
+                turn_id=turn_id,
+                kind=kind,
+                name=name,
+                duration_ms=duration_ms,
+                details=details,
+                sequence=sequence,
+            )
+
+        return record
+
+    def turn_spans(
+        self, consultation_id: str, *, turn_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Timed steps recorded for this consultation, optionally one turn.
+
+        Loads the consultation first so an unknown id fails loudly instead of
+        looking like a turn that recorded nothing.
+        """
+        self.get_consultation(consultation_id)
+        return self.repository.list_turn_spans(consultation_id, turn_id=turn_id)
+
+    def metrics(self, *, window_minutes: int | None = None) -> dict[str, Any]:
+        """Service-wide health numbers, aggregated from the audit trail.
+
+        ``window_minutes`` limits the sample to recent turns - the useful
+        window when asking "what is happening right now" rather than "what has
+        this deployment ever done".
+        """
+        since = None
+        if window_minutes is not None and window_minutes > 0:
+            from datetime import UTC, datetime, timedelta
+
+            since = (datetime.now(UTC) - timedelta(minutes=window_minutes)).isoformat()
+        return self.repository.metrics_snapshot(since=since)
+
     def consultation_usage(self, consultation_id: str) -> dict[str, Any]:
         """Token usage for a consultation, aggregated from the audit trail.
 
@@ -873,7 +972,8 @@ class ConsultationService:
         )
         if not resume:
             return self._approval_progress_result(approval.consultation_id, decided)
-        return self.resume_approved_consultation(approval.consultation_id)
+        # 直接走内部实现：决策和它触发的执行属于同一次操作，共用 turn_id。
+        return self._resume_inner(approval.consultation_id)
 
     @correlated
     def reject_approval(
@@ -963,7 +1063,16 @@ class ConsultationService:
 
     @correlated
     def resume_approved_consultation(self, consultation_id: str) -> dict[str, Any]:
-        """Continue an interrupted thread once every action has a decision."""
+        """Continue an interrupted thread once every action has a decision.
+
+        Kept as a separate entry point so a caller resuming directly gets its
+        own turn id. ``decide_approval`` bypasses it via ``_resume_inner`` and
+        stays in the turn it already opened - otherwise one approval split into
+        two audit chains and "what did this approval cost" needed two queries.
+        """
+        return self._resume_inner(consultation_id)
+
+    def _resume_inner(self, consultation_id: str) -> dict[str, Any]:
         consultation = self.get_consultation(consultation_id)
         pending = self.list_pending_approvals(consultation_id)
         if pending:
@@ -1073,7 +1182,11 @@ class ConsultationService:
             async with AsyncSqliteSaver.from_conn_string(
                 str(self.checkpoint_path)
             ) as checkpointer:
-                config = _agent_config(consultation.thread_id)
+                config = _agent_config(
+                    consultation.thread_id,
+                    consultation.id,
+                    span_recorder=self._span_recorder(consultation.id),
+                )
                 agent = create_agent_app(
                     self.repository.database_path,
                     settings,
@@ -1085,10 +1198,29 @@ class ConsultationService:
                     Command(resume={"decisions": decisions}), config=config
                 )
 
+        # 与 chat 对称：恢复也会跑完整一轮 Agent，缺了这两行则"审批后到底
+        # 执行了什么"在日志里完全不可见（审计表里有，但要写 SQL 才看得到）。
+        with log_context(
+            consultation_id=consultation.id, thread_id=consultation.thread_id
+        ) as log:
+            log.info("恢复轮次开始 interrupt_id=%s", interrupt_id)
+        resume_started = time.monotonic()
         result = await_turn(run_resume(), consultation_id=consultation.id)
-        return self._finalize_agent_result(
-            consultation, result, resumed_interrupt_ids=(interrupt_id,)
+        finalized = self._finalize_agent_result(
+            consultation,
+            result,
+            resumed_interrupt_ids=(interrupt_id,),
+            duration_ms=_elapsed_ms(resume_started),
         )
+        with log_context(
+            consultation_id=consultation.id, thread_id=consultation.thread_id
+        ) as log:
+            log.info(
+                "恢复轮次完成 status=%s tool_calls=%s",
+                finalized.get("status"),
+                ",".join(finalized.get("tool_calls") or []) or "none",
+            )
+        return finalized
 
     def chat_consultation_stream(
         self,
@@ -1132,13 +1264,26 @@ class ConsultationService:
         provider_settings = ProviderSettings.from_env()
         tools = self._build_agent_tools(provider_settings)
         thread_lock = _THREAD_LOCKS.for_thread(consultation.thread_id)
+        stream_started = time.monotonic()
+        with log_context(
+            consultation_id=consultation_id, thread_id=consultation.thread_id
+        ) as log:
+            log.info(
+                "流式轮次开始 model=%s message=%s",
+                model_name or loaded.model_name,
+                summarize(user_message),
+            )
 
         async def _turn() -> AsyncIterator[dict[str, Any]]:
             async with thread_lock:
                 async with AsyncSqliteSaver.from_conn_string(
                     str(self.checkpoint_path)
                 ) as checkpointer:
-                    config = _agent_config(consultation.thread_id)
+                    config = _agent_config(
+                    consultation.thread_id,
+                    consultation.id,
+                    span_recorder=self._span_recorder(consultation.id),
+                )
                     checkpoint = await checkpointer.aget_tuple(config)
                     agent = create_agent_app(
                         self.repository.database_path,
@@ -1223,10 +1368,21 @@ class ConsultationService:
                     interrupts = getattr(final_state, "interrupts", ())
                     if interrupts:
                         result["__interrupt__"] = interrupts
-                    yield {
-                        "type": "done",
-                        "result": self._finalize_agent_result(consultation, result),
-                    }
+                    finalized = self._finalize_agent_result(
+                        consultation,
+                        result,
+                        duration_ms=_elapsed_ms(stream_started),
+                    )
+                    with log_context(
+                        consultation_id=consultation.id,
+                        thread_id=consultation.thread_id,
+                    ) as log:
+                        log.info(
+                            "流式轮次完成 status=%s tool_calls=%s",
+                            finalized.get("status"),
+                            ",".join(finalized.get("tool_calls") or []) or "none",
+                        )
+                    yield {"type": "done", "result": finalized}
 
         return _persistent_runner().iter_async(_turn())
 
@@ -1236,6 +1392,7 @@ class ConsultationService:
         result: dict[str, Any],
         *,
         resumed_interrupt_ids: tuple[str, ...] = (),
+        duration_ms: int | None = None,
     ) -> dict[str, Any]:
         """Persist a finished Agent turn, or surface a fresh pause.
 
@@ -1287,6 +1444,7 @@ class ConsultationService:
                     # 成本记进审计：事后要能回答"这一轮花了多少 token"，
                     # 而不是只能看账单。
                     "usage": usage,
+                    **({"duration_ms": duration_ms} if duration_ms is not None else {}),
                 },
             )
         )

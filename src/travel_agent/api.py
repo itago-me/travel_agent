@@ -114,6 +114,16 @@ def create_app(database_path: str | Path, api_token: str | None = None) -> FastA
         """
         return {"status": "ok", "auth": "bearer" if token else "none"}
 
+    @app.get("/metrics", dependencies=auth)
+    def metrics(window_minutes: int | None = None) -> dict[str, Any]:
+        """Turn health for the whole service.
+
+        Behind auth on purpose: the numbers reveal usage volume and token spend,
+        which is business data even though no consultation id appears here.
+        ``?window_minutes=60`` narrows the sample to the last hour.
+        """
+        return service.metrics(window_minutes=window_minutes)
+
     @app.post("/consultations", dependencies=auth)
     def start_consultation(request: StartRequest) -> dict[str, Any]:
         consultation = service.create_consultation(

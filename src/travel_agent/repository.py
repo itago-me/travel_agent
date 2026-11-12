@@ -19,6 +19,30 @@ from .domain import (
 )
 
 
+def _percentiles(values: list[int]) -> dict[str, int]:
+    """Nearest-rank percentiles for a latency sample.
+
+    Nearest-rank (rather than interpolation) is deliberate: the numbers are
+    integer milliseconds and a reported p99 must be a latency the system
+    actually produced, not a value between two observations.
+    """
+    if not values:
+        return {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0}
+    ordered = sorted(values)
+
+    def at(fraction: float) -> int:
+        index = max(0, min(len(ordered) - 1, int(round(fraction * len(ordered))) - 1))
+        return ordered[index]
+
+    return {
+        "count": len(ordered),
+        "p50": at(0.50),
+        "p95": at(0.95),
+        "p99": at(0.99),
+        "max": ordered[-1],
+    }
+
+
 def _amount_tolerance() -> float:
     """Relative difference allowed between booked and quoted amounts.
 
@@ -93,6 +117,20 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (consultation_id) REFERENCES consultations(id)
                 );
+                CREATE TABLE IF NOT EXISTS turn_spans (
+                    id TEXT PRIMARY KEY,
+                    consultation_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (consultation_id) REFERENCES consultations(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_turn_spans_turn
+                    ON turn_spans(turn_id, sequence);
                 CREATE TABLE IF NOT EXISTS itinerary_drafts (
                     id TEXT PRIMARY KEY,
                     consultation_id TEXT NOT NULL UNIQUE,
@@ -423,6 +461,82 @@ class SQLiteRepository:
                 "UPDATE consultations SET status = ?, updated_at = ? WHERE id = ?",
                 (status, utc_now(), consultation_id),
             )
+
+    def add_turn_span(
+        self,
+        *,
+        consultation_id: str,
+        turn_id: str,
+        kind: str,
+        name: str,
+        duration_ms: int,
+        details: dict[str, Any] | None = None,
+        sequence: int | None = None,
+    ) -> None:
+        """Record one timed step inside a turn.
+
+        Spans are what answer "where did this turn spend its time" after the
+        fact - the log line that said the same thing is gone once the process
+        exits.
+
+        ``sequence`` is supplied by the caller, not derived with
+        ``MAX(sequence)+1``: parallel tool calls insert concurrently and every
+        one of them would read the same max, producing duplicate sequence
+        numbers (observed). The callback that sees the events assigns a
+        single-threaded counter instead.
+        """
+        with self._connect() as connection:
+            self._ensure_exists(connection, consultation_id)
+            if sequence is None:
+                sequence = connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM turn_spans"
+                    " WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO turn_spans
+                   (id, consultation_id, turn_id, sequence, kind, name,
+                    duration_ms, details, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid4()),
+                    consultation_id,
+                    turn_id,
+                    int(sequence),
+                    kind,
+                    name,
+                    int(duration_ms),
+                    json.dumps(details or {}, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+
+    def list_turn_spans(
+        self, consultation_id: str, turn_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Spans of one consultation, optionally limited to a single turn."""
+        query = "SELECT * FROM turn_spans WHERE consultation_id = ?"
+        params: list[Any] = [consultation_id]
+        if turn_id:
+            query += " AND turn_id = ?"
+            params.append(turn_id)
+        # 按 sequence 而不是 created_at 排序：并行工具调用的插入时刻是交错的，
+        # 用 created_at 会把同一批并发 span 打散（实测出现过 1,4,2,3 的顺序）。
+        query += " ORDER BY turn_id, sequence"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "turn_id": row["turn_id"],
+                "sequence": int(row["sequence"]),
+                "kind": row["kind"],
+                "name": row["name"],
+                "duration_ms": int(row["duration_ms"]),
+                "details": json.loads(row["details"] or "{}"),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def add_audit_event(self, event: AuditEvent) -> None:
         with self._connect() as connection:
@@ -1001,6 +1115,79 @@ class SQLiteRepository:
                 (consultation_id,),
             ).fetchone()
         return int(row[0])
+
+    def metrics_snapshot(self, *, since: str | None = None) -> dict[str, Any]:
+        """Aggregate turn-level health numbers from the audit trail.
+
+        阶段 8.4 第 2 步：日志能回答"这一轮发生了什么"，指标要回答"整体现在
+        怎么样"。数据源就是审计表——它已经跟着业务事务一起写，不需要另开
+        计数器表，也就不会出现"计数器和事实不一致"这种故障。
+
+        ``since`` 是 ISO 时间戳下界（按 created_at 字符串比较，与写入格式
+        一致）；省略则统计全部历史。
+        """
+        where = "WHERE created_at >= ?" if since else ""
+        params: tuple[Any, ...] = (since,) if since else ()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT event_type, details, created_at FROM audit_events
+                    {where}""",
+                params,
+            ).fetchall()
+
+        completed = 0
+        stopped: dict[str, int] = {}
+        durations: list[int] = []
+        input_tokens = output_tokens = 0
+        tool_calls = 0
+        tool_events = 0
+        consultations: set[str] = set()
+
+        for row in rows:
+            details = json.loads(row["details"]) or {}
+            event_type = row["event_type"]
+            if event_type == "AGENT_CHAT_COMPLETED":
+                completed += 1
+                usage = details.get("usage") or {}
+                if usage.get("reported"):
+                    input_tokens += int(usage.get("input_tokens") or 0)
+                    output_tokens += int(usage.get("output_tokens") or 0)
+                tool_calls += len(details.get("tool_calls") or [])
+            elif event_type.startswith("TURN_STOPPED_BY_"):
+                reason = event_type.removeprefix("TURN_STOPPED_BY_").lower()
+                stopped[reason] = stopped.get(reason, 0) + 1
+            if event_type in ("TOOL_EXECUTED", "TOOL_FAILED"):
+                tool_events += 1
+            duration = details.get("duration_ms")
+            if isinstance(duration, int) and duration >= 0:
+                durations.append(duration)
+
+        total_turns = completed + sum(stopped.values())
+        return {
+            "turns": {
+                "total": total_turns,
+                "completed": completed,
+                "stopped": stopped,
+                "failed": sum(stopped.values()),
+                "error_rate": (
+                    round(sum(stopped.values()) / total_turns, 4) if total_turns else 0.0
+                ),
+            },
+            "latency_ms": _percentiles(durations),
+            "tokens": {
+                "input": input_tokens,
+                "output": output_tokens,
+                "total": input_tokens + output_tokens,
+                "per_turn": (
+                    round((input_tokens + output_tokens) / completed) if completed else 0
+                ),
+            },
+            "tools": {
+                "calls_total": tool_events,
+                "per_turn": round(tool_calls / completed, 2) if completed else 0.0,
+            },
+            "since": since,
+        }
 
     def consult_usage_totals(self, consultation_id: str) -> dict[str, Any]:
         """Aggregate token usage recorded by finished turns of one consultation.

@@ -75,9 +75,13 @@ class ToolGovernanceMiddleware(AgentMiddleware):
         from .domain import AuditEvent
         from .logging_utils import log_context
 
-        with log_context(consultation_id=self.consultation_id) as log:
-            record = log.warning if event_type == "TOOL_FAILED" else log.info
-            record("工具 %s %s", tool_name, event_type)
+        # 成功执行由 tracing.TurnTraceCallback 记录（带耗时和结果条数）；
+        # 这里只记「tracer 看不到的东西」——被预算拦下、参数非法等根本没执行
+        # 到工具的事件。两边都记会让每次工具调用打两行日志。
+        if event_type != "TOOL_EXECUTED":
+            with log_context(consultation_id=self.consultation_id) as log:
+                record = log.warning if event_type != "TOOL_BLOCKED" else log.warning
+                record("工具 %s %s", tool_name, event_type)
         self.repository.add_audit_event(
             AuditEvent(
                 consultation_id=self.consultation_id,

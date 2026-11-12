@@ -24,6 +24,9 @@ from .correlation import current_turn_id
 LOGGER_NAME = "travel_agent"
 logger = logging.getLogger(LOGGER_NAME)
 
+# 是否已由调用方显式指定过级别（见 configure_logging 的注释）
+_level_explicit = False
+
 _LEVELS = {
     "debug": logging.DEBUG,
     "info": logging.INFO,
@@ -38,10 +41,29 @@ def configure_logging(level: str | None = None) -> None:
     Idempotent: repeated calls (every service construction) do not stack
     handlers, which would otherwise duplicate every line.
     """
+    # 级别是「显式设置一次就锁住」：CLI 先调 configure_logging("info")，
+    # 随后 ConsultationService.__init__ 也会调一次（不带参数），若后者用
+    # 默认值覆盖，CLI 的设置就静默失效——实测踩过。handler 只挂一次，
+    # 级别只在没人显式设置时才落到默认的 warning。
+    global _level_explicit
+    raw = (level or os.getenv("TRAVEL_AGENT_LOG_LEVEL") or "").strip().lower()
+    if raw:
+        resolved = _LEVELS.get(raw)
+        if resolved is None:
+            # 静默回退到 warning 会让配置错误（例如 .env 里多写了一个反斜杠）
+            # 永远不被发现——这里明确报出来，并说明实际生效的值。
+            logging.getLogger(LOGGER_NAME).warning(
+                "无法识别的日志级别 %r，回退到 warning（可选值：%s）",
+                raw,
+                "/".join(_LEVELS),
+            )
+            resolved = logging.WARNING
+        logger.setLevel(resolved)
+        _level_explicit = True
+    elif not _level_explicit:
+        logger.setLevel(logging.WARNING)
     if logger.handlers:
         return
-    raw = (level or os.getenv("TRAVEL_AGENT_LOG_LEVEL") or "warning").strip().lower()
-    logger.setLevel(_LEVELS.get(raw, logging.WARNING))
     handler = logging.StreamHandler()
     handler.setFormatter(
         logging.Formatter(

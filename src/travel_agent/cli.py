@@ -1,9 +1,11 @@
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from .application import create_consultation_service
+from .logging_utils import configure_logging
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("sensitive-tools")
 
+    parser.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error"),
+        default=None,
+        help="log verbosity; defaults to info (TRAVEL_AGENT_LOG_LEVEL overrides)",
+    )
     eval_parser = subparsers.add_parser(
         "eval", help="run the evaluation task suite against a real model"
     )
@@ -81,6 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--stream",
         action="store_true",
         help="print model output as it arrives instead of waiting for the turn to finish",
+    )
+
+    trace = subparsers.add_parser(
+        "trace", help="show where a turn spent its time"
+    )
+    trace.add_argument("consultation_id")
+    trace.add_argument(
+        "--turn", default=None, help="only this turn id (default: all turns)"
     )
 
     itineraries = subparsers.add_parser("itineraries")
@@ -234,6 +250,63 @@ def _run_eval(args: argparse.Namespace) -> int:
     return 0 if report.failed == 0 else 1
 
 
+def _run_trace(service: Any, args: Any) -> int:
+    """Print the span breakdown of one or more turns.
+
+    Written for a human reading a terminal: the slowest step is called out,
+    because "which step ate the time" is the question this command exists to
+    answer. Machine-readable output is not offered here - the data is in
+    ``turn_spans`` for anything that needs to process it.
+    """
+    spans = service.turn_spans(args.consultation_id, turn_id=args.turn)
+    if not spans:
+        print(f"no spans recorded for {args.consultation_id}")
+        return 1
+
+    by_turn: dict[str, list[dict[str, Any]]] = {}
+    turn_order: list[str] = []
+    for span in spans:
+        if span["turn_id"] not in by_turn:
+            turn_order.append(span["turn_id"])
+            by_turn[span["turn_id"]] = []
+        by_turn[span["turn_id"]].append(span)
+    # span 已按 sequence 排好；turn 之间按首次出现（= 最早写入）排序
+    by_turn = {turn_id: by_turn[turn_id] for turn_id in turn_order}
+
+    for turn_id, turn_spans in by_turn.items():
+        total = sum(span["duration_ms"] for span in turn_spans)
+        print(f"turn {turn_id}  总耗时 {total}ms  ({len(turn_spans)} 步)")
+        widest = max(turn_spans, key=lambda span: span["duration_ms"])
+        for span in turn_spans:
+            share = (span["duration_ms"] / total * 100) if total else 0.0
+            bar = "█" * max(1, int(round(share / 4)))
+            marker = "  ← 最慢" if span is widest and len(turn_spans) > 1 else ""
+            detail = _span_detail(span)
+            print(
+                f"  {span['sequence']:>2}. {span['name']:<28} "
+                f"{span['duration_ms']:>7}ms {share:>5.1f}% {bar}{detail}{marker}"
+            )
+        print()
+    return 0
+
+
+def _span_detail(span: dict[str, Any]) -> str:
+    """Render the bit of span metadata that matters for this span kind."""
+    details = span.get("details") or {}
+    if span["kind"] == "model":
+        parts = []
+        for key, label in (("input_tokens", "in"), ("output_tokens", "out")):
+            value = details.get(key)
+            if isinstance(value, int) and value >= 0:
+                parts.append(f"{label}={value}")
+        return ("  " + " ".join(parts)) if parts else ""
+    if "result_count" in details:
+        return f"  结果 {details['result_count']} 条"
+    if "error" in details:
+        return f"  失败 {details['error']}"
+    return ""
+
+
 def _chat_streaming(service: Any, args: Any) -> int:
     """Print a turn as the model produces it, then a status line.
 
@@ -289,6 +362,17 @@ def _chat_streaming(service: Any, args: Any) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one CLI command.
+
+    Log level defaults to ``info`` here rather than ``warning``: this is a
+    human-facing entry point, and the whole point of a console command is to
+    watch the turn happen. ``--log-level warning`` restores quiet output, and an
+    explicit ``TRAVEL_AGENT_LOG_LEVEL`` always wins.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser.add_argument("--log-level")
+    known, _ = early_parser.parse_known_args(argv)
+    configure_logging(known.log_level or os.getenv("TRAVEL_AGENT_LOG_LEVEL") or "info")
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "eval":
@@ -439,6 +523,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     consultation = service.get_consultation(args.consultation_id)
+    if args.command == "trace":
+        return _run_trace(service, args)
+
     if args.command == "itineraries":
         print(
             json.dumps(
