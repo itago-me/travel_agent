@@ -44,3 +44,6 @@ evals/results/
 
 # 本地应急依赖目录（环境只读时 pip --target 的产物，不入库）
 .deps/
+
+# 本地工具目录（ruff 等，--target 安装的产物，不入库）
+.tools/

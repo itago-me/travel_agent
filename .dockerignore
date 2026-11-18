@@ -1,0 +1,46 @@
+# 构建上下文过滤：决定哪些文件会发给 docker daemon。
+# 少传文件 = 构建更快；排除密钥和数据 = 不泄露。
+
+# ── 密钥：绝不进镜像 ──
+.env
+.env.*
+!.env.example
+
+# ── 运行期数据：靠卷挂载，不进镜像 ──
+data/
+tmp/
+*.db
+*.sqlite
+*.sqlite3
+
+# ── 版本控制与工具缓存 ──
+.git
+.gitignore
+.github
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# ── Python 构建产物与本地依赖 ──
+__pycache__/
+*.py[cod]
+*.egg-info
+build/
+dist/
+.venv/
+venv/
+env/
+.deps/
+.tools/
+
+# ── 测试、评测与实验：运行时不依赖 ──
+tests/
+evals/
+experiments/
+
+# ── 文档与编辑器 ──
+README.md
+schedule.md
+.idea/
+.vscode/
+.DS_Store

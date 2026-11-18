@@ -1,0 +1,45 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: travel-agent:latest
+    container_name: travel-agent-app
+
+    ports:
+      - "127.0.0.1:8077:8077"
+
+    env_file:
+      - .env
+
+    environment:
+      TRAVEL_AGENT_DATABASE: /app/data/travel_agent.db
+      TRAVEL_AGENT_HOTEL_PROVIDER: sqlite
+      TRAVEL_AGENT_TRANSPORT_PROVIDER: sqlite
+      TRAVEL_AGENT_ATTRACTION_PROVIDER: sqlite
+      all_proxy: ""
+      ALL_PROXY: ""
+
+    volumes:
+      - ./data:/app/data
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8077/health', timeout=3).status==200 else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
