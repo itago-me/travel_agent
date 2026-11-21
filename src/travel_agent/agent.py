@@ -78,12 +78,18 @@ def _positive_env(name: str, default: int) -> int:
 
 
 def _governance_middleware(
-    database: str | Path, consultation_id: str | None
+    database: str | Path,
+    consultation_id: str | None,
+    repository: Any | None = None,
 ) -> list[Any]:
     """Tool audit + call budget, only when the turn belongs to a consultation.
 
     ``consultation_id`` is absent for factory smoke tests that only assert tool
     wiring, so governance stays out of that path rather than inventing an owner.
+
+    ``repository`` 必须是**业务数据所在的仓储**：工具预算靠
+    ``count_tool_executions`` 统计审计事件，如果治理写 SQLite 而业务读
+    Postgres，预算就永远不会触发（阶段 9 C1 的关键点）。
     """
     if not consultation_id:
         return []
@@ -92,7 +98,7 @@ def _governance_middleware(
 
     return [
         ToolGovernanceMiddleware(
-            SQLiteRepository(database),
+            repository if repository is not None else SQLiteRepository(database),
             consultation_id,
             max_calls=_positive_env("TRAVEL_AGENT_MAX_TOOL_CALLS", 30),
         )
@@ -108,6 +114,7 @@ def create_agent_app(
     flyai_client: FlyAIClient | None = None,
     tools: list[Any] | None = None,
     consultation_id: str | None = None,
+    repository: Any | None = None,
 ):
     """Create the production Agent using LangChain's official factory."""
     settings = settings or load_agent_settings()
@@ -140,7 +147,7 @@ def create_agent_app(
                 provider_settings=provider_settings,
                 flyai_client=flyai_client,
             ),
-            *create_sensitive_booking_tools(database),
+            *create_sensitive_booking_tools(database, repository=repository),
         ]
     agent_kwargs: dict[str, Any] = {
         "model": model,
@@ -156,7 +163,7 @@ def create_agent_app(
                 max_messages=_positive_env("TRAVEL_AGENT_CONTEXT_MAX_MESSAGES", 12),
                 max_tokens=_positive_env("TRAVEL_AGENT_CONTEXT_MAX_TOKENS", 4000),
             ),
-            *_governance_middleware(database, consultation_id),
+            *_governance_middleware(database, consultation_id, repository),
             HumanInTheLoopMiddleware(
                 interrupt_on={
                     "create_mock_booking": {

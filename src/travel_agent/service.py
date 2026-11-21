@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any, AsyncIterator, Callable, Iterator
 from uuid import uuid4
@@ -19,8 +20,10 @@ from .domain import (
 from .correlation import correlated
 from .persistent import PersistentLoopRunner
 from .logging_utils import configure_logging, log_context, summarize
+from .postgres_repository import plain_dsn
 from .tracing import TurnTraceCallback
 from .repository import SQLiteRepository
+from .repository_protocol import RepositoryProtocol
 from .tool_governance import ToolBudgetExceeded
 from .requirement_extractor import extract_requirements
 from .agent import AgentSettings, create_agent_app, load_agent_settings
@@ -367,17 +370,64 @@ def _agent_config(
 class ConsultationService:
     def __init__(
         self,
-        repository: SQLiteRepository,
+        repository: RepositoryProtocol,
         checkpoint_path: str | Path | None = None,
+        *,
+        agent_database: str | Path | None = None,
+        checkpoint_dsn: str | None = None,
     ):
-        self.repository = repository
+        """构造服务。
+
+        参数分工（阶段 9 C1 的解耦结果）：
+
+        - ``repository``：业务数据的仓储，可以是 SQLite 或 Postgres；
+        - ``agent_database``：**工具数据源与 checkpointer 用的 SQLite 路径**。
+          旅行查询工具读的是种子数据表（``travel_*``），仍然留在 SQLite；
+          与业务仓储分开后，业务数据搬到 Postgres 时工具不必跟着改。
+        - ``checkpoint_dsn``：给了它就用 Postgres checkpointer，否则用
+          ``checkpoint_path`` 指向的 SQLite 文件。
+        """
+        # 依赖接口而非 SQLiteRepository 具体类：PostgresRepository 只要满足
+        # RepositoryProtocol 就能直接接进来。
+        self.repository: RepositoryProtocol = repository
+
+        # 业务仓储可能是 Postgres（没有 database_path），所以工具用的 SQLite
+        # 路径不再从仓储推导；确实没给且仓储也不是 SQLite 时明确报错，而不是
+        # 在第一次调用工具时才炸。
+        derived = getattr(repository, "database_path", None)
+        self.agent_database = Path(agent_database or derived or "data/travel_agent.db")
+
+        self.checkpoint_dsn = plain_dsn(checkpoint_dsn) if checkpoint_dsn else None
         self.checkpoint_path = Path(
             checkpoint_path
-            or repository.database_path.with_name(
-                f"{repository.database_path.stem}_checkpoints.sqlite"
+            or Path(self.agent_database).with_name(
+                f"{Path(self.agent_database).stem}_checkpoints.sqlite"
             )
         )
         configure_logging()
+
+    @asynccontextmanager
+    async def _checkpointer(self) -> AsyncIterator[Any]:
+        """LangGraph 的对话状态存储，两种后端二选一。
+
+        Postgres saver 会自建 ``checkpoints`` / ``checkpoint_writes`` 等表——
+        那是 LangGraph 的领地，**不要写进 Alembic 迁移**，它有自己的
+        ``checkpoint_migrations`` 版本表。首次连接调用 ``setup()`` 建表。
+        """
+        if self.checkpoint_dsn:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            async with AsyncPostgresSaver.from_conn_string(
+                self.checkpoint_dsn
+            ) as saver:
+                await saver.setup()
+                yield saver
+            return
+
+        async with AsyncSqliteSaver.from_conn_string(
+            str(self.checkpoint_path)
+        ) as saver:
+            yield saver
 
     def create_consultation(
         self,
@@ -465,9 +515,7 @@ class ConsultationService:
         if self.checkpoint_path.exists():
 
             async def read_interrupts():
-                async with AsyncSqliteSaver.from_conn_string(
-                    str(self.checkpoint_path)
-                ) as checkpointer:
+                async with self._checkpointer() as checkpointer:
                     checkpoint = await checkpointer.aget_tuple(
                         {"configurable": {"thread_id": consultation.thread_id}}
                     )
@@ -532,10 +580,10 @@ class ConsultationService:
         """
         return [
             *create_travel_tools(
-                self.repository.database_path,
+                self.agent_database,
                 provider_settings=provider_settings,
             ),
-            *create_sensitive_booking_tools(self.repository.database_path),
+            *create_sensitive_booking_tools(repository=self.repository),
         ]
 
     @correlated
@@ -582,9 +630,7 @@ class ConsultationService:
                 return await _run_chat_inner()
 
         async def _run_chat_inner():
-            async with AsyncSqliteSaver.from_conn_string(
-                str(self.checkpoint_path)
-            ) as checkpointer:
+            async with self._checkpointer() as checkpointer:
                 config = _agent_config(
                     consultation.thread_id,
                     consultation.id,
@@ -612,10 +658,11 @@ class ConsultationService:
                         },
                     }
                 agent = create_agent_app(
-                    self.repository.database_path,
+                    self.agent_database,
                     settings,
                     checkpointer=checkpointer,
                     tools=tools,
+                    repository=self.repository,
                     consultation_id=consultation_id,
                 )
                 history_status = "complete"
@@ -1179,19 +1226,18 @@ class ConsultationService:
                 return await _run_resume_inner()
 
         async def _run_resume_inner():
-            async with AsyncSqliteSaver.from_conn_string(
-                str(self.checkpoint_path)
-            ) as checkpointer:
+            async with self._checkpointer() as checkpointer:
                 config = _agent_config(
                     consultation.thread_id,
                     consultation.id,
                     span_recorder=self._span_recorder(consultation.id),
                 )
                 agent = create_agent_app(
-                    self.repository.database_path,
+                    self.agent_database,
                     settings,
                     checkpointer=checkpointer,
                     tools=tools,
+                    repository=self.repository,
                     consultation_id=consultation.id,
                 )
                 return await agent.ainvoke(
@@ -1276,9 +1322,7 @@ class ConsultationService:
 
         async def _turn() -> AsyncIterator[dict[str, Any]]:
             async with thread_lock:
-                async with AsyncSqliteSaver.from_conn_string(
-                    str(self.checkpoint_path)
-                ) as checkpointer:
+                async with self._checkpointer() as checkpointer:
                     config = _agent_config(
                     consultation.thread_id,
                     consultation.id,
@@ -1286,10 +1330,11 @@ class ConsultationService:
                 )
                     checkpoint = await checkpointer.aget_tuple(config)
                     agent = create_agent_app(
-                        self.repository.database_path,
+                        self.agent_database,
                         settings,
                         checkpointer=checkpointer,
-                        tools=tools,
+                            tools=tools,
+                        repository=self.repository,
                         consultation_id=consultation.id,
                     )
                     if checkpoint is not None:

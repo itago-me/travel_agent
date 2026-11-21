@@ -23,6 +23,11 @@ RUN python -c 'import tomllib, pathlib; deps = tomllib.loads(pathlib.Path("pypro
 COPY src ./src
 RUN pip install --no-deps .
 
+# 迁移脚本与配置：migrate 服务要在**同一个镜像**里执行 `alembic upgrade head`。
+# 只装包不带这些，容器里就没有 alembic.ini 和 versions/，迁移无从谈起。
+COPY alembic.ini ./
+COPY migrations ./migrations
+
 
 RUN mkdir -p /app/data \
   && useradd --create-home --uid 1000 appuser \

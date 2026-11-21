@@ -1,4 +1,102 @@
+# travel-agent 的容器编排。
+#
+# 三个阶段按顺序发生，靠 depends_on 的 condition 串起来：
+#
+#   postgres（等 healthy）→ migrate（跑完退出）→ app（启动服务）
+#
+# 为什么 migrate 单独一个容器而不是塞进 app 的启动脚本：
+# 迁移失败时你会希望 app **根本不启动**，而不是起来一半再崩。分开之后
+# `depends_on: condition: service_completed_successfully` 恰好表达这个语义，
+# 而且迁移日志是独立的，不用在 app 的日志里翻。
+#
+# 数据库的口令从环境变量读，默认值只适合本机开发。部署到别处时务必改掉：
+#   POSTGRES_USER=... POSTGRES_PASSWORD=... POSTGRES_DB=...
+#
+# 启动：docker compose up -d
+# 停止（保留数据）：docker compose down
+# 连库删数据：docker compose down -v
+
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: travel-agent-postgres
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-travel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-travel}
+      POSTGRES_DB: ${POSTGRES_DB:-travel_agent}
+      # 中文排序与比较依赖 locale；不设的话默认 C locale 会让 ORDER BY 结果
+      # 与开发环境不一致。
+      LANG: C.UTF-8
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+
+    # 只绑本机回环：数据库不该对整个网络开放。
+    #
+    # 宿主机端口默认 5433 而不是 5432，因为开发机上常常已经有一个本地 Postgres
+    # 占着 5432（本项目实测如此：本机 PostgreSQL 18.7）。**容器之间走服务名
+    # `postgres:5432`，完全不受这个映射影响**——它只影响「宿主机怎么连」，
+    # 也就是给 psql / 调试用。真要换回 5432：POSTGRES_HOST_PORT=5432。
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+
+    volumes:
+      # 命名卷而不是绑定挂载：Postgres 的数据目录对权限与文件系统特性敏感，
+      # 交给 Docker 管理比映射到项目目录里省心。
+      - pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      # pg_isready 只检查服务是否接受连接，比 `SELECT 1` 更轻。
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-travel} -d ${POSTGRES_DB:-travel_agent}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: travel-agent:latest
+    container_name: travel-agent-migrate
+
+    # app 的启动命令是 uvicorn；这里覆盖成迁移。跑完容器退出，
+    # depends_on 的 service_completed_successfully 据此放行 app。
+    command: ["alembic", "upgrade", "head"]
+
+    env_file:
+      - .env
+
+    environment:
+      # 即使 .env 里没配，这里也强制指向 compose 内的 postgres。
+      # `environment` 的优先级高于 `env_file`，所以 .env 里的旧值不会覆盖它。
+      TRAVEL_AGENT_DATABASE_BACKEND: postgres
+      TRAVEL_AGENT_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-travel}:${POSTGRES_PASSWORD:-travel}@postgres:5432/${POSTGRES_DB:-travel_agent}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # 迁移是一次性任务：失败就停在那里让人看日志，不要无限重启。
+    restart: "no"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   app:
     build:
       context: .
@@ -13,15 +111,26 @@ services:
       - .env
 
     environment:
+      # 业务数据进 Postgres；对话状态（checkpoint）不单独配置，
+      # 会跟随 backend 自动用同一个库。
+      TRAVEL_AGENT_DATABASE_BACKEND: postgres
+      TRAVEL_AGENT_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-travel}:${POSTGRES_PASSWORD:-travel}@postgres:5432/${POSTGRES_DB:-travel_agent}
+      # 工具数据源仍是 SQLite：travel_* 种子表没有迁移计划。
       TRAVEL_AGENT_DATABASE: /app/data/travel_agent.db
       TRAVEL_AGENT_HOTEL_PROVIDER: sqlite
       TRAVEL_AGENT_TRANSPORT_PROVIDER: sqlite
       TRAVEL_AGENT_ATTRACTION_PROVIDER: sqlite
+      # 容器里没有代理，空值避免继承宿主机的 proxy 变量导致连接被劫持。
       all_proxy: ""
       ALL_PROXY: ""
 
     volumes:
+      # 种子数据（travel_* 表）仍需持久化。
       - ./data:/app/data
+
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
     restart: unless-stopped
 
@@ -43,3 +152,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  pgdata:

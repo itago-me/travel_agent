@@ -1,6 +1,7 @@
 """LangChain tools backed by normalized travel provider contracts."""
 
 from pathlib import Path
+from typing import Any
 
 from langchain_core.tools import StructuredTool
 
@@ -81,9 +82,21 @@ def create_travel_tools(
     ]
 
 
-def create_sensitive_booking_tools(database: str | Path) -> list[StructuredTool]:
-    """Build booking tools that must be paired with HITL before Agent exposure."""
-    repository = SQLiteRepository(database)
+def create_sensitive_booking_tools(
+    database: str | Path | None = None,
+    *,
+    repository: Any | None = None,
+) -> list[StructuredTool]:
+    """Build booking tools that must be paired with HITL before Agent exposure.
+
+    两种构造方式：给 ``repository`` 时直接用它（业务数据搬到 Postgres 后走这条，
+    预订与审计才会和业务数据在同一个库），否则按 ``database`` 路径自建
+    SQLite 仓储（保留给脚本与既有测试）。
+    """
+    if repository is None:
+        if database is None:
+            raise ValueError("create_sensitive_booking_tools 需要 database 或 repository")
+        repository = SQLiteRepository(database)
 
     async def create_booking(**kwargs):
         request = CreateMockBookingRequest.model_validate(kwargs)
