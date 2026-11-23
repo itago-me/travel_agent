@@ -283,10 +283,25 @@ class SQLiteRepository:
                 expires_at TEXT,
                 FOREIGN KEY (consultation_id) REFERENCES consultations(id)
             )""",
-            ("id", "consultation_id", "thread_id", "interrupt_id", "action_index",
-             "tool_name", "tool_arguments", "risk_level", "status", "requested_by",
-             "decision", "decided_by", "decision_reason", "edited_arguments",
-             "created_at", "decided_at", "expires_at"),
+            (
+                "id",
+                "consultation_id",
+                "thread_id",
+                "interrupt_id",
+                "action_index",
+                "tool_name",
+                "tool_arguments",
+                "risk_level",
+                "status",
+                "requested_by",
+                "decision",
+                "decided_by",
+                "decision_reason",
+                "edited_arguments",
+                "created_at",
+                "decided_at",
+                "expires_at",
+            ),
         ),
         "mock_bookings": (
             """CREATE TABLE mock_bookings__new (
@@ -305,9 +320,19 @@ class SQLiteRepository:
                 FOREIGN KEY (consultation_id) REFERENCES consultations(id),
                 FOREIGN KEY (itinerary_version_id) REFERENCES itinerary_versions(id)
             )""",
-            ("id", "consultation_id", "itinerary_version_id", "total_amount",
-             "status", "idempotency_key", "cancellation_idempotency_key",
-             "cancellation_reason", "created_at", "updated_at", "cancelled_at"),
+            (
+                "id",
+                "consultation_id",
+                "itinerary_version_id",
+                "total_amount",
+                "status",
+                "idempotency_key",
+                "cancellation_idempotency_key",
+                "cancellation_reason",
+                "created_at",
+                "updated_at",
+                "cancelled_at",
+            ),
         ),
     }
 
@@ -544,9 +569,7 @@ class SQLiteRepository:
             self._insert_audit_event(connection, event)
 
     @staticmethod
-    def _insert_audit_event(
-        connection: sqlite3.Connection, event: AuditEvent
-    ) -> None:
+    def _insert_audit_event(connection: sqlite3.Connection, event: AuditEvent) -> None:
         """Write an audit row on an existing connection.
 
         Used by write operations that must record the audit row atomically with
@@ -844,9 +867,7 @@ class SQLiteRepository:
             if selected_version_id
             else "no version is selected yet"
         )
-        fix = (
-            f"travel-agent select-itinerary {consultation_id} {itinerary_version_id}"
-        )
+        fix = f"travel-agent select-itinerary {consultation_id} {itinerary_version_id}"
         return (
             f"itinerary version must be selected before booking: "
             f"requested {itinerary_version_id}, but {selected}. "
@@ -866,9 +887,9 @@ class SQLiteRepository:
                ORDER BY v.version_number""",
             (consultation_id,),
         ).fetchall()
-        return ", ".join(
-            f"v{row['version_number']}={row['id']}" for row in rows
-        ) or "none"
+        return (
+            ", ".join(f"v{row['version_number']}={row['id']}" for row in rows) or "none"
+        )
 
     def _check_amount_against_version(
         self,
@@ -944,7 +965,9 @@ class SQLiteRepository:
             ).fetchone()
             if version is None:
                 raise KeyError(
-                    self._describe_missing_version(connection, consultation_id, itinerary_version_id)
+                    self._describe_missing_version(
+                        connection, consultation_id, itinerary_version_id
+                    )
                 )
             selected_version_id = version["selected_version_id"]
             if selected_version_id != itinerary_version_id:
@@ -1141,7 +1164,6 @@ class SQLiteRepository:
         input_tokens = output_tokens = 0
         tool_calls = 0
         tool_events = 0
-        consultations: set[str] = set()
 
         for row in rows:
             details = json.loads(row["details"]) or {}
@@ -1170,7 +1192,9 @@ class SQLiteRepository:
                 "stopped": stopped,
                 "failed": sum(stopped.values()),
                 "error_rate": (
-                    round(sum(stopped.values()) / total_turns, 4) if total_turns else 0.0
+                    round(sum(stopped.values()) / total_turns, 4)
+                    if total_turns
+                    else 0.0
                 ),
             },
             "latency_ms": _percentiles(durations),
@@ -1179,7 +1203,9 @@ class SQLiteRepository:
                 "output": output_tokens,
                 "total": input_tokens + output_tokens,
                 "per_turn": (
-                    round((input_tokens + output_tokens) / completed) if completed else 0
+                    round((input_tokens + output_tokens) / completed)
+                    if completed
+                    else 0
                 ),
             },
             "tools": {

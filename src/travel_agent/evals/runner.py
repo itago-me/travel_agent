@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..application import create_consultation_service
-from .fixtures import prepare_eval_database
 from .checks import CheckOutcome, apply_checks, hard_failures, soft_score
+from .fixtures import prepare_eval_database
 from .tasks import EvalTask
 
 

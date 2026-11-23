@@ -320,17 +320,49 @@ def test_client_survives_multiple_event_loops():
 
 
 def test_semaphore_is_created_once_and_reused():
-    """6.4 常驻 loop 下信号量建一次即可；同 loop 内重复获取是同一实例。"""
+    """同一个 loop 内重复获取必须拿到同一实例。
+
+    **不能**用两次 ``asyncio.run`` 来断言：那是两个 loop，而实现是按 loop
+    重建信号量的（``_semaphore_loop_id``）。旧版本这么写了，在开发机上
+    「通过」纯属巧合——旧 loop 释放后新 loop 拿到了同一块内存地址，
+    ``id(loop)`` 相等。换成一套更新的依赖后地址不同，测试立刻失败。
+    """
+    client = FlyAIClient(concurrency_limit=2)
+
+    async def grab_twice():
+        return (
+            client._semaphore_for_current_loop(),
+            client._semaphore_for_current_loop(),
+            id(asyncio.get_running_loop()),
+        )
+
+    first, second, loop_id = asyncio.run(grab_twice())
+
+    assert first is not None
+    assert first is second, "同一个 loop 内必须复用同一个信号量"
+    assert client._semaphore_loop_id == loop_id
+
+
+def test_semaphore_is_rebound_when_the_loop_changes():
+    """换了 loop 之后，信号量必须属于**当前** loop。
+
+    这里只断言「绑定关系正确」，不断言「实例一定不同」——如果 CPython 把
+    新 loop 分配到刚释放的同一地址，``id(loop)`` 会相等，实现也就不会重建。
+    断言一个不成立的条件，正是上一个测试脆弱的根源。
+    """
     client = FlyAIClient(concurrency_limit=2)
 
     async def grab():
-        return client._semaphore_for_current_loop()
+        return id(client._semaphore_for_current_loop()), id(
+            asyncio.get_running_loop()
+        )
 
-    first = asyncio.run(grab())
-    second = asyncio.run(grab())
+    first_semaphore_id, first_loop_id = asyncio.run(grab())
+    second_semaphore_id, second_loop_id = asyncio.run(grab())
 
-    assert first is not None and second is not None
-    assert first is second, "常驻 loop 内必须复用同一个信号量"
+    assert client._semaphore_loop_id == second_loop_id
+    if first_loop_id != second_loop_id:
+        assert first_semaphore_id != second_semaphore_id
 
 
 def test_eager_semaphore_deadlocks_across_loops():

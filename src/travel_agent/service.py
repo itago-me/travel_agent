@@ -4,10 +4,20 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import date
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
 from uuid import uuid4
-from pathlib import Path
 
+from langchain_core.messages import RemoveMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphRecursionError
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.types import Command
+from pydantic import ValidationError
+
+from .agent import AgentSettings, create_agent_app, load_agent_settings
+from .booking import CancelMockBookingRequest, CreateMockBookingRequest
+from .correlation import correlated
 from .domain import (
     ApprovalDecision,
     ApprovalRequest,
@@ -17,27 +27,15 @@ from .domain import (
     CustomerPreference,
     Message,
 )
-from .correlation import correlated
-from .persistent import PersistentLoopRunner
-from .logging_utils import configure_logging, log_context, summarize
-from .postgres_repository import plain_dsn
-from .tracing import TurnTraceCallback
-from .repository import SQLiteRepository
-from .repository_protocol import RepositoryProtocol
-from .tool_governance import ToolBudgetExceeded
-from .requirement_extractor import extract_requirements
-from .agent import AgentSettings, create_agent_app, load_agent_settings
 from .langchain_tools import create_sensitive_booking_tools, create_travel_tools
+from .logging_utils import configure_logging, log_context, summarize
+from .persistent import PersistentLoopRunner
+from .postgres_repository import plain_dsn
 from .provider_factory import ProviderSettings
-from langchain_core.messages import RemoveMessage
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.errors import GraphRecursionError
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.types import Command
-from pydantic import ValidationError
-
-from .booking import CancelMockBookingRequest, CreateMockBookingRequest
-
+from .repository_protocol import RepositoryProtocol
+from .requirement_extractor import extract_requirements
+from .tool_governance import ToolBudgetExceeded
+from .tracing import TurnTraceCallback
 
 # The graph is only allowed to stop on these two high-risk actions. The set is
 # duplicated from the middleware configuration on purpose: the service must not

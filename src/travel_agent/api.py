@@ -24,7 +24,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .application import create_consultation_service
-from .persistent import PersistentLoopRunner
 
 
 class ChatRequest(BaseModel):
@@ -292,7 +291,6 @@ app = create_app(_default_database(), _resolve_api_token())
 
 
 def _find_consultation(service, consultation_id: str):
-    from .domain import Consultation
 
     try:
         return service.get_consultation(consultation_id)
@@ -321,7 +319,6 @@ def main() -> int:
         )
         return 2
 
-    import sys
 
     token = _resolve_api_token(args.api_token)
     app = create_app(args.database, token)

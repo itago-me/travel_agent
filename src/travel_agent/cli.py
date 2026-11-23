@@ -91,9 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="print model output as it arrives instead of waiting for the turn to finish",
     )
 
-    trace = subparsers.add_parser(
-        "trace", help="show where a turn spent its time"
-    )
+    trace = subparsers.add_parser("trace", help="show where a turn spent its time")
     trace.add_argument("consultation_id")
     trace.add_argument(
         "--turn", default=None, help="only this turn id (default: all turns)"
@@ -226,7 +224,9 @@ def _run_eval(args: argparse.Namespace) -> int:
                 previous = json.loads(previous_path.read_text("utf-8"))
                 # 只跑了一部分任务时（--only），"其余任务消失"是无意义的噪音，
                 # 甚至会被误读成任务被删。此时只比较两次都跑过的任务。
-                comparison = compare_reports(previous, report.as_dict(), shared_only=True)
+                comparison = compare_reports(
+                    previous, report.as_dict(), shared_only=True
+                )
                 if args.only:
                     print(f"\nvs {previous_path.name} (only tasks run here):")
                 else:
@@ -355,6 +355,7 @@ def _chat_streaming(service: Any, args: Any) -> int:
         "consultation_id": result.get("consultation_id"),
         "tool_calls": result.get("tool_calls") or tool_calls,
         "usage": usage,
+        "tokens": tokens,
     }
     print()
     print(json.dumps(summary, ensure_ascii=False))
@@ -458,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
                 edited_arguments=edited_arguments,
                 resume=not args.no_resume,
             )
-        except KeyError as error:
+        except KeyError:
             return _fail(parser, f"审批请求不存在: {args.approval_id}")
         except ValueError as error:
             return _fail(parser, str(error))

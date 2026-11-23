@@ -5,7 +5,6 @@ import json
 import os
 import random
 import subprocess
-import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,7 +17,11 @@ from .flyai_errors import (
     FlyAITimeoutError,
     FlyAIUnavailableError,
 )
-from .providers import AttractionSearchRequest, HotelSearchRequest, TransportSearchRequest
+from .providers import (
+    AttractionSearchRequest,
+    HotelSearchRequest,
+    TransportSearchRequest,
+)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 

@@ -132,12 +132,12 @@ def create_agent_app(
     model = create_chat_model(settings)
     from langchain.agents.middleware import HumanInTheLoopMiddleware
 
-    from .langchain_tools import create_sensitive_booking_tools, create_travel_tools
     from .agent_context import (
         ContextWindowMiddleware,
-        TravelMemoryMiddleware,
         TravelAgentState,
+        TravelMemoryMiddleware,
     )
+    from .langchain_tools import create_sensitive_booking_tools, create_travel_tools
 
     provider_settings = provider_settings or ProviderSettings.from_env()
     if tools is None:
